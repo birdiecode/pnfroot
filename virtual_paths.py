@@ -135,6 +135,7 @@ class VirtualRoot:
             key=lambda bind: len(split_virtual_path(bind.virtual_path)),
             reverse=True,
         )
+        self.ensure_bind_mountpoints()
         self.cwd_by_pid: dict[int, str] = {}
         self.fd_paths_by_pid: dict[int, dict[int, str]] = {}
 
@@ -164,6 +165,46 @@ class VirtualRoot:
         if virtual_path == "/":
             return self.root
         return os.path.join(self.root, virtual_path[1:])
+
+    def rootfs_backing_path(self, virtual_path: str) -> str:
+        virtual_path = normalize_virtual_path(virtual_path)
+        if virtual_path == "/":
+            return self.root
+        return os.path.join(self.root, *split_virtual_path(virtual_path))
+
+    def ensure_bind_mountpoints(self) -> None:
+        for bind in self.binds:
+            self.ensure_bind_mountpoint(bind)
+
+    def ensure_bind_mountpoint(self, bind: BindMount) -> None:
+        if bind.virtual_path == "/":
+            return
+
+        target = self.rootfs_backing_path(bind.virtual_path)
+        parent = os.path.dirname(target)
+        self.ensure_path_stays_under_root(parent)
+        os.makedirs(parent, exist_ok=True)
+
+        if os.path.isdir(bind.host_path):
+            if os.path.exists(target) and not os.path.isdir(target):
+                raise RuntimeError(
+                    f"bind target exists and is not a directory: {bind.virtual_path}"
+                )
+            os.makedirs(target, exist_ok=True)
+            return
+
+        if os.path.isdir(target):
+            raise RuntimeError(
+                f"bind target exists as a directory for file bind: {bind.virtual_path}"
+            )
+        if not os.path.exists(target):
+            open(target, "a", encoding="utf-8").close()
+
+    def ensure_path_stays_under_root(self, path: str) -> None:
+        root = os.path.realpath(self.root)
+        resolved = os.path.realpath(path)
+        if os.path.commonpath([root, resolved]) != root:
+            raise RuntimeError(f"bind target escapes rootfs: {path}")
 
     def bind_for(self, virtual_path: str) -> BindMount | None:
         virtual_path = normalize_virtual_path(virtual_path)

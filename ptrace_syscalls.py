@@ -444,7 +444,8 @@ def parse_args() -> argparse.Namespace:
         metavar="HOST[:VIRTUAL]",
         help=(
             "bind a host path into the virtual root; repeatable, and HOST alone "
-            "binds it at the same absolute path"
+            "binds it at the same absolute path; missing targets are created "
+            "inside the rootfs"
         ),
     )
     parser.add_argument(
