@@ -87,6 +87,7 @@ class ExecutableIds:
 
 
 class VirtualIds:
+    CHOWN_SYSCALLS = {"chown", "fchown", "fchownat", "lchown"}
     POINTER_GETTER_SYSCALLS = {"getresuid", "getresgid", "getgroups"}
     SETTER_SYSCALLS = {
         "setuid",
@@ -131,7 +132,12 @@ class VirtualIds:
     def neutralize_syscall(
         self, pid: int, name: str, regs: UserRegsStruct
     ) -> dict[str, object]:
-        if name not in self.SETTER_SYSCALLS | self.POINTER_GETTER_SYSCALLS:
+        if (
+            name
+            not in self.SETTER_SYSCALLS
+            | self.POINTER_GETTER_SYSCALLS
+            | self.CHOWN_SYSCALLS
+        ):
             return {}
 
         regs.orig_rax = self.noop_syscall_number
@@ -176,6 +182,8 @@ class VirtualIds:
             self.handle_gid_setter(context, record)
         elif name in {"execve", "execveat"}:
             self.handle_exec(context, record)
+        elif name in self.CHOWN_SYSCALLS:
+            self.handle_chown(context, record)
 
     def handle_exec(self, context: SyscallContext, record: SyscallRecord) -> None:
         if syscall_error(context.result or 0) is not None:
@@ -345,6 +353,24 @@ class VirtualIds:
             result = -errno.ENOSYS
 
         set_syscall_result(context, result)
+
+    def handle_chown(self, context: SyscallContext, record: SyscallRecord) -> None:
+        credentials = self.credentials(context.pid)
+        if record.name == "fchownat":
+            uid = self.id_arg(record.args[2])
+            gid = self.id_arg(record.args[3])
+        else:
+            uid = self.id_arg(record.args[1])
+            gid = self.id_arg(record.args[2])
+
+        if not self.id_arg_or_none_is_valid(uid) or not self.id_arg_or_none_is_valid(
+            gid
+        ):
+            set_syscall_result(context, -errno.EINVAL)
+        elif credentials.euid == 0:
+            set_syscall_result(context, 0)
+        else:
+            set_syscall_result(context, -errno.EPERM)
 
     def apply_setuid(self, credentials: VirtualCredentials, uid: int) -> int:
         if not self.valid_id(uid):
