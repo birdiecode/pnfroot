@@ -5,10 +5,12 @@ from __future__ import annotations
 import errno
 import os
 import posixpath
+import tempfile
 from dataclasses import dataclass
 
 from ptrace_common import (
     ARG_REGISTERS,
+    SYSCALL_NUMBERS,
     SyscallContext,
     SyscallRecord,
     UserRegsStruct,
@@ -24,7 +26,29 @@ from ptrace_common import (
 
 AT_FDCWD = -100
 O_DIRECTORY = 0o200000
+O_ACCMODE = 0o3
 SCRATCH_STACK_GAP = 256
+MS_BIND = 4096
+MS_REC = 16384
+VIRTUAL_MOUNT_FILES = {
+    "/etc/mtab": "mounts",
+    "/proc/mounts": "mounts",
+    "/proc/self/mounts": "mounts",
+    "/proc/self/mountinfo": "mountinfo",
+}
+VIRTUAL_MOUNT_FILE_SYSCALLS = {
+    "access",
+    "faccessat",
+    "faccessat2",
+    "lstat",
+    "newfstatat",
+    "newlstat",
+    "newstat",
+    "open",
+    "openat",
+    "stat",
+    "statx",
+}
 
 
 @dataclass(frozen=True)
@@ -38,12 +62,26 @@ class PathArgSpec:
 class BindMount:
     host_path: str
     virtual_path: str
+    source_display: str | None = None
+    recursive: bool = False
+    origin: str = "cli"
 
     @classmethod
-    def from_paths(cls, host_path: str, virtual_path: str) -> BindMount:
+    def from_paths(
+        cls,
+        host_path: str,
+        virtual_path: str,
+        *,
+        source_display: str | None = None,
+        recursive: bool = False,
+        origin: str = "cli",
+    ) -> BindMount:
         return cls(
             host_path=os.path.realpath(host_path),
             virtual_path=normalize_virtual_path(virtual_path),
+            source_display=source_display,
+            recursive=recursive,
+            origin=origin,
         )
 
 
@@ -115,6 +153,15 @@ def split_virtual_path(path: str) -> list[str]:
     return [part for part in path.split("/") if part and part != "."]
 
 
+def escape_mount_field(value: str) -> str:
+    return (
+        value.replace("\\", "\\134")
+        .replace(" ", "\\040")
+        .replace("\t", "\\011")
+        .replace("\n", "\\012")
+    )
+
+
 class TraceeScratch:
     def __init__(self, pid: int, regs: UserRegsStruct):
         self.pid = pid
@@ -138,6 +185,7 @@ class VirtualRoot:
         self.ensure_bind_mountpoints()
         self.cwd_by_pid: dict[int, str] = {}
         self.fd_paths_by_pid: dict[int, dict[int, str]] = {}
+        self.noop_syscall_number = SYSCALL_NUMBERS.get("getpid", 39)
 
     def register_pid(self, pid: int, cwd: str = "/") -> None:
         self.cwd_by_pid[pid] = normalize_virtual_path(cwd)
@@ -175,6 +223,118 @@ class VirtualRoot:
     def ensure_bind_mountpoints(self) -> None:
         for bind in self.binds:
             self.ensure_bind_mountpoint(bind)
+
+    def add_bind(self, bind: BindMount) -> None:
+        self.binds = [
+            existing
+            for existing in self.binds
+            if existing.virtual_path != bind.virtual_path
+        ]
+        self.binds.append(bind)
+        self.binds.sort(
+            key=lambda item: len(split_virtual_path(item.virtual_path)),
+            reverse=True,
+        )
+        self.ensure_bind_mountpoint(bind)
+
+    def remove_bind(self, virtual_path: str) -> bool:
+        virtual_path = normalize_virtual_path(virtual_path)
+        old_count = len(self.binds)
+        self.binds = [
+            bind for bind in self.binds if bind.virtual_path != virtual_path
+        ]
+        return len(self.binds) != old_count
+
+    def virtual_mount_file_kind(self, virtual_path: str) -> str | None:
+        return VIRTUAL_MOUNT_FILES.get(normalize_virtual_path(virtual_path))
+
+    def should_use_virtual_mount_file(self, name: str, args: list[int]) -> bool:
+        if name not in VIRTUAL_MOUNT_FILE_SYSCALLS:
+            return False
+        if name in {"open", "openat"}:
+            flags_index = 1 if name == "open" else 2
+            flags = signed64(args[flags_index])
+            return flags & O_ACCMODE == os.O_RDONLY
+        return True
+
+    def make_virtual_mount_file(self, kind: str) -> str:
+        content = (
+            self.render_mountinfo()
+            if kind == "mountinfo"
+            else self.render_mounts()
+        )
+        fd, path = tempfile.mkstemp(prefix="pnfroot-mount-table-")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        return path
+
+    def render_mounts(self) -> str:
+        lines = ["rootfs / rootfs rw,relatime 0 0\n"]
+        for bind in self.binds:
+            options = self.bind_mount_options(bind)
+            lines.append(
+                f"{escape_mount_field(self.mount_source(bind))} "
+                f"{escape_mount_field(bind.virtual_path)} "
+                f"none {options} 0 0\n"
+            )
+        return "".join(lines)
+
+    def render_mountinfo(self) -> str:
+        lines = ["1 0 0:1 / / rw,relatime - rootfs rootfs rw\n"]
+        for mount_id, bind in enumerate(self.binds, start=2):
+            super_options = self.bind_mount_options(bind)
+            lines.append(
+                f"{mount_id} 1 0:{mount_id} / "
+                f"{escape_mount_field(bind.virtual_path)} rw,relatime - "
+                f"none {escape_mount_field(self.mount_source(bind))} "
+                f"{super_options}\n"
+            )
+        return "".join(lines)
+
+    def bind_mount_options(self, bind: BindMount) -> str:
+        options = ["rw", "bind"]
+        if bind.recursive:
+            options.append("rbind")
+        if bind.origin == "internal":
+            options.append("pnfroot.internal-bind")
+        else:
+            options.append("pnfroot.cli-bind")
+        return ",".join(options)
+
+    def mount_source(self, bind: BindMount) -> str:
+        return bind.source_display or bind.host_path
+
+    def internal_mount_directory(
+        self, virtual_path: str, *, allow_root: bool = True
+    ) -> tuple[str | None, int]:
+        virtual_path = normalize_virtual_path(virtual_path)
+        if virtual_path == "/" and not allow_root:
+            return None, errno.EPERM
+        if self.bind_for(virtual_path) is not None:
+            return None, errno.EPERM
+
+        host_path = self.host_path(virtual_path)
+        root = os.path.realpath(self.root)
+        resolved = os.path.realpath(host_path)
+        if os.path.commonpath([root, resolved]) != root:
+            return None, errno.EPERM
+        if not os.path.exists(host_path):
+            return None, errno.ENOENT
+        if not os.path.isdir(host_path):
+            return None, errno.ENOTDIR
+        return host_path, 0
+
+    def cleanup_temporary_paths(self, record: SyscallRecord) -> None:
+        paths = record.metadata.pop("temporary_paths", [])
+        if not isinstance(paths, list):
+            return
+        for path in paths:
+            if not isinstance(path, str):
+                continue
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
     def ensure_bind_mountpoint(self, bind: BindMount) -> None:
         if bind.virtual_path == "/":
@@ -269,9 +429,128 @@ class VirtualRoot:
 
         return normalize_virtual_path(posixpath.join(base, path))
 
+    def neutralize_mount_syscall(
+        self, pid: int, name: str, args: list[int], regs: UserRegsStruct
+    ) -> dict[str, object]:
+        if name == "mount":
+            metadata = self.prepare_mount(pid, args)
+        elif name in {"umount", "umount2"}:
+            metadata = self.prepare_umount(pid, args)
+        else:
+            return {}
+
+        regs.orig_rax = self.noop_syscall_number
+        set_regs(pid, regs)
+        metadata["mount_neutralized"] = True
+        return metadata
+
+    def prepare_mount(self, pid: int, args: list[int]) -> dict[str, object]:
+        source = self.read_string(pid, args[0])
+        target = self.read_string(pid, args[1])
+        filesystem = self.read_string(pid, args[2])
+        flags = args[3]
+
+        if target is None:
+            return {
+                "mount_action": "mount",
+                "mount_result": -errno.EFAULT,
+            }
+
+        target_virtual = self.virtual_path(pid, target)
+        if target_virtual is None:
+            return {
+                "mount_action": "mount",
+                "mount_result": -errno.ENOENT,
+            }
+
+        if not flags & MS_BIND:
+            return {
+                "mount_action": "mount",
+                "mount_result": -errno.EPERM,
+                "mount_virtual_target": target_virtual,
+                "mount_filesystem": filesystem,
+            }
+
+        if source is None:
+            return {
+                "mount_action": "mount",
+                "mount_result": -errno.EFAULT,
+                "mount_virtual_target": target_virtual,
+            }
+
+        source_virtual = self.virtual_path(pid, source)
+        if source_virtual is None:
+            return {
+                "mount_action": "mount",
+                "mount_result": -errno.ENOENT,
+                "mount_virtual_target": target_virtual,
+            }
+
+        source_host, source_error = self.internal_mount_directory(source_virtual)
+        if source_error:
+            return {
+                "mount_action": "mount",
+                "mount_result": -source_error,
+                "mount_virtual_source": source_virtual,
+                "mount_virtual_target": target_virtual,
+            }
+
+        target_host, target_error = self.internal_mount_directory(
+            target_virtual, allow_root=False
+        )
+        if target_error:
+            return {
+                "mount_action": "mount",
+                "mount_result": -target_error,
+                "mount_virtual_source": source_virtual,
+                "mount_virtual_target": target_virtual,
+            }
+
+        return {
+            "mount_action": "mount",
+            "mount_result": 0,
+            "mount_kind": "bind",
+            "mount_recursive": bool(flags & MS_REC),
+            "mount_virtual_source": source_virtual,
+            "mount_virtual_target": target_virtual,
+            "mount_host_source": source_host,
+            "mount_host_target": target_host,
+        }
+
+    def prepare_umount(self, pid: int, args: list[int]) -> dict[str, object]:
+        target = self.read_string(pid, args[0])
+        if target is None:
+            return {
+                "mount_action": "umount",
+                "mount_result": -errno.EFAULT,
+            }
+
+        target_virtual = self.virtual_path(pid, target)
+        if target_virtual is None:
+            return {
+                "mount_action": "umount",
+                "mount_result": -errno.ENOENT,
+            }
+
+        return {
+            "mount_action": "umount",
+            "mount_result": 0,
+            "mount_virtual_target": target_virtual,
+        }
+
+    def read_string(self, pid: int, address: int) -> str | None:
+        data = read_c_string_bytes(pid, address)
+        if data is None:
+            return None
+        return os.fsdecode(data)
+
     def rewrite_syscall_entry(
         self, pid: int, name: str, args: list[int], regs: UserRegsStruct
     ) -> dict[str, object]:
+        mount_metadata = self.neutralize_mount_syscall(pid, name, args, regs)
+        if mount_metadata:
+            return mount_metadata
+
         specs = PATH_ARG_SPECS.get(name)
         metadata: dict[str, object] = {}
         if not specs:
@@ -293,9 +572,18 @@ class VirtualRoot:
             if virtual_path is None:
                 continue
 
-            host_path = self.host_path(
-                virtual_path, follow_final_symlink=spec.follow_final_symlink
-            )
+            mount_file_kind = self.virtual_mount_file_kind(virtual_path)
+            if mount_file_kind is not None and self.should_use_virtual_mount_file(
+                name, args
+            ):
+                host_path = self.make_virtual_mount_file(mount_file_kind)
+                temporary_paths = metadata.setdefault("temporary_paths", [])
+                if isinstance(temporary_paths, list):
+                    temporary_paths.append(host_path)
+            else:
+                host_path = self.host_path(
+                    virtual_path, follow_final_symlink=spec.follow_final_symlink
+                )
             host_address = scratch.write_c_string(os.fsencode(host_path))
             setattr(regs, ARG_REGISTERS[spec.path_index], host_address)
             changed = True
@@ -347,6 +635,17 @@ class VirtualRoot:
     ) -> None:
         if record is None:
             return
+        try:
+            self.handle_syscall_exit_record(context, record)
+        finally:
+            self.cleanup_temporary_paths(record)
+
+    def handle_syscall_exit_record(
+        self, context: SyscallContext, record: SyscallRecord
+    ) -> None:
+        if "mount_action" in record.metadata:
+            self.handle_mount_exit(context, record)
+            return
 
         if record.name == "getcwd":
             self.rewrite_getcwd_result(context)
@@ -391,3 +690,53 @@ class VirtualRoot:
             virtual_path = fd_paths.get(old_fd)
             if virtual_path is not None:
                 fd_paths[new_fd] = virtual_path
+
+    def handle_mount_exit(
+        self, context: SyscallContext, record: SyscallRecord
+    ) -> None:
+        result = record.metadata.get("mount_result", -errno.EPERM)
+        if result != 0:
+            set_syscall_result(context, int(result))
+            return
+
+        action = record.metadata.get("mount_action")
+        if action == "mount":
+            result = self.apply_mount(record)
+            set_syscall_result(context, -result if result else 0)
+        elif action == "umount":
+            target = record.metadata.get("mount_virtual_target")
+            if isinstance(target, str) and self.remove_bind(target):
+                set_syscall_result(context, 0)
+            else:
+                set_syscall_result(context, -errno.EINVAL)
+        else:
+            set_syscall_result(context, -errno.EPERM)
+
+    def apply_mount(self, record: SyscallRecord) -> int:
+        if record.metadata.get("mount_kind") != "bind":
+            return errno.EPERM
+
+        host_source = record.metadata.get("mount_host_source")
+        virtual_target = record.metadata.get("mount_virtual_target")
+        if not isinstance(host_source, str) or not isinstance(virtual_target, str):
+            return errno.EPERM
+
+        source_display = record.metadata.get("mount_virtual_source")
+        recursive = bool(record.metadata.get("mount_recursive"))
+        try:
+            self.add_bind(
+                BindMount.from_paths(
+                    host_source,
+                    virtual_target,
+                    source_display=(
+                        source_display if isinstance(source_display, str) else None
+                    ),
+                    recursive=recursive,
+                    origin="internal",
+                )
+            )
+        except OSError as exc:
+            return exc.errno or errno.EPERM
+        except RuntimeError:
+            return errno.EPERM
+        return 0
