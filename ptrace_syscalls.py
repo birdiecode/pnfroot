@@ -4,6 +4,7 @@
 Usage examples:
     ./ptrace_syscalls.py -- /bin/ls -la
     ./ptrace_syscalls.py --rootfs ./ubuntu_c --quiet -- /bin/bash
+    ./ptrace_syscalls.py --rootfs ./ubuntu_c --uid 0 --gid 0 --quiet -- /bin/bash
 
 This script is intentionally dependency-free. It currently supports Linux
 x86_64, where syscall arguments live in rdi, rsi, rdx, r10, r8, r9.
@@ -20,6 +21,7 @@ import platform
 import posixpath
 import re
 import signal
+import stat as stat_module
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -55,6 +57,23 @@ AT_FDCWD = -100
 O_DIRECTORY = 0o200000
 SCRATCH_STACK_GAP = 256
 ARG_REGISTERS = ("rdi", "rsi", "rdx", "r10", "r8", "r9")
+NO_ID = 0xFFFFFFFF
+# Unprivileged rootfs extraction often loses owner 0 and setuid bits. Treat the
+# usual privileged account-management helpers as virtual setuid-root executables.
+DEFAULT_SETUID_ROOT_PATHS = {
+    "/bin/passwd",
+    "/bin/su",
+    "/usr/bin/chfn",
+    "/usr/bin/chsh",
+    "/usr/bin/gpasswd",
+    "/usr/bin/mount",
+    "/usr/bin/newgrp",
+    "/usr/bin/passwd",
+    "/usr/bin/su",
+    "/usr/bin/sudo",
+    "/usr/bin/sudoedit",
+    "/usr/bin/umount",
+}
 
 TRACE_OPTIONS = (
     PTRACE_O_TRACESYSGOOD
@@ -289,6 +308,7 @@ def load_syscall_names() -> dict[int, str]:
 
 
 SYSCALL_NAMES = load_syscall_names()
+SYSCALL_NUMBERS = {name: number for number, name in SYSCALL_NAMES.items()}
 
 STRING_ARGS = {
     "open": {0},
@@ -393,6 +413,30 @@ def read_pointer(pid: int, address: int) -> int:
     return word & mask
 
 
+def read_tracee_u32(pid: int, address: int) -> int:
+    word = ptrace_peek(pid, address & ~(WORD_SIZE - 1))
+    shift = (address % WORD_SIZE) * 8
+    return (word >> shift) & 0xFFFFFFFF
+
+
+def read_tracee_u32_array(pid: int, address: int, count: int) -> list[int]:
+    return [read_tracee_u32(pid, address + index * 4) for index in range(count)]
+
+
+def write_tracee_u32(pid: int, address: int, value: int) -> None:
+    aligned = address & ~(WORD_SIZE - 1)
+    shift = (address % WORD_SIZE) * 8
+    mask = 0xFFFFFFFF << shift
+    word = ptrace_peek(pid, aligned)
+    word = (word & ~mask) | ((value & 0xFFFFFFFF) << shift)
+    ptrace_poke(pid, aligned, word)
+
+
+def write_tracee_u32_array(pid: int, address: int, values: list[int]) -> None:
+    for index, value in enumerate(values):
+        write_tracee_u32(pid, address + index * 4, value)
+
+
 def read_string_array(pid: int, address: int, max_items: int = 8) -> str:
     if address == 0:
         return "NULL"
@@ -445,6 +489,12 @@ def format_return(value: int) -> str:
         err_name = errno.errorcode.get(err_no, f"ERRNO_{err_no}")
         return f"-1 {err_name} (kernel returned {value})"
     return str(value)
+
+
+def set_syscall_result(context: SyscallContext, value: int) -> None:
+    context.regs.rax = ctypes.c_ulonglong(value).value
+    context.result = int(context.regs.rax)
+    set_regs(context.pid, context.regs)
 
 
 @dataclass(frozen=True)
@@ -539,6 +589,486 @@ class TraceeScratch:
         self.cursor = (self.cursor - len(data)) & ~(WORD_SIZE - 1)
         write_tracee_bytes(self.pid, self.cursor, data)
         return self.cursor
+
+
+@dataclass
+class VirtualCredentials:
+    ruid: int
+    euid: int
+    suid: int
+    fsuid: int
+    rgid: int
+    egid: int
+    sgid: int
+    fsgid: int
+
+    @classmethod
+    def from_ids(cls, uid: int, gid: int) -> VirtualCredentials:
+        return cls(
+            ruid=uid,
+            euid=uid,
+            suid=uid,
+            fsuid=uid,
+            rgid=gid,
+            egid=gid,
+            sgid=gid,
+            fsgid=gid,
+        )
+
+    def copy(self) -> VirtualCredentials:
+        return VirtualCredentials(
+            ruid=self.ruid,
+            euid=self.euid,
+            suid=self.suid,
+            fsuid=self.fsuid,
+            rgid=self.rgid,
+            egid=self.egid,
+            sgid=self.sgid,
+            fsgid=self.fsgid,
+        )
+
+
+@dataclass(frozen=True)
+class ExecutableIds:
+    mode: int
+    uid: int
+    gid: int
+
+
+class VirtualIds:
+    RESULT_SYSCALLS = {"getuid", "geteuid", "getgid", "getegid"}
+    POINTER_GETTER_SYSCALLS = {"getresuid", "getresgid", "getgroups"}
+    SETTER_SYSCALLS = {
+        "setuid",
+        "setreuid",
+        "setresuid",
+        "setfsuid",
+        "setgid",
+        "setregid",
+        "setresgid",
+        "setfsgid",
+        "setgroups",
+    }
+
+    def __init__(self, uid: int, gid: int):
+        self.initial = VirtualCredentials.from_ids(uid, gid)
+        self.credentials_by_pid: dict[int, VirtualCredentials] = {}
+        self.groups_by_pid: dict[int, list[int]] = {}
+        self.host_uid = os.getuid()
+        self.host_gid = os.getgid()
+        self.noop_syscall_number = SYSCALL_NUMBERS.get("getpid", 39)
+
+    def register_pid(self, pid: int) -> None:
+        self.credentials_by_pid[pid] = self.initial.copy()
+        self.groups_by_pid[pid] = [self.initial.egid]
+
+    def inherit_pid(self, parent_pid: int, child_pid: int) -> None:
+        parent_credentials = self.credentials_by_pid.get(parent_pid, self.initial)
+        self.credentials_by_pid[child_pid] = parent_credentials.copy()
+        self.groups_by_pid[child_pid] = list(
+            self.groups_by_pid.get(parent_pid, [parent_credentials.egid])
+        )
+
+    def drop_pid(self, pid: int) -> None:
+        self.credentials_by_pid.pop(pid, None)
+        self.groups_by_pid.pop(pid, None)
+
+    def credentials(self, pid: int) -> VirtualCredentials:
+        if pid not in self.credentials_by_pid:
+            self.register_pid(pid)
+        return self.credentials_by_pid[pid]
+
+    def neutralize_syscall(
+        self, pid: int, name: str, regs: UserRegsStruct
+    ) -> dict[str, object]:
+        if name not in self.SETTER_SYSCALLS | self.POINTER_GETTER_SYSCALLS:
+            return {}
+
+        regs.orig_rax = self.noop_syscall_number
+        set_regs(pid, regs)
+        return {"virtual_ids_neutralized": True}
+
+    def handle_syscall_exit(
+        self, context: SyscallContext, record: SyscallRecord | None
+    ) -> None:
+        if record is None:
+            return
+
+        name = record.name
+        if name == "getuid":
+            set_syscall_result(context, self.credentials(context.pid).ruid)
+        elif name == "geteuid":
+            set_syscall_result(context, self.credentials(context.pid).euid)
+        elif name == "getgid":
+            set_syscall_result(context, self.credentials(context.pid).rgid)
+        elif name == "getegid":
+            set_syscall_result(context, self.credentials(context.pid).egid)
+        elif name == "getresuid":
+            self.handle_getresuid(context)
+        elif name == "getresgid":
+            self.handle_getresgid(context)
+        elif name == "getgroups":
+            self.handle_getgroups(context)
+        elif name in {
+            "setuid",
+            "setreuid",
+            "setresuid",
+            "setfsuid",
+        }:
+            self.handle_uid_setter(context, record)
+        elif name in {
+            "setgid",
+            "setregid",
+            "setresgid",
+            "setfsgid",
+            "setgroups",
+        }:
+            self.handle_gid_setter(context, record)
+        elif name in {"execve", "execveat"}:
+            self.handle_exec(context, record)
+
+    def handle_exec(self, context: SyscallContext, record: SyscallRecord) -> None:
+        if syscall_error(context.result or 0) is not None:
+            return
+
+        executable = self.executable_ids(record)
+        if executable is None:
+            return
+
+        credentials = self.credentials(context.pid)
+        if executable.mode & stat_module.S_ISUID:
+            credentials.euid = executable.uid
+            credentials.suid = executable.uid
+            credentials.fsuid = executable.uid
+
+        if executable.mode & stat_module.S_ISGID:
+            credentials.egid = executable.gid
+            credentials.sgid = executable.gid
+            credentials.fsgid = executable.gid
+
+    def executable_ids(self, record: SyscallRecord) -> ExecutableIds | None:
+        virtual_path = record.metadata.get("exec_virtual_path")
+        host_path = record.metadata.get("exec_host_path")
+
+        if not isinstance(host_path, str):
+            return None
+
+        try:
+            st = os.stat(host_path)
+        except OSError:
+            return None
+
+        mode = stat_module.S_IMODE(st.st_mode)
+        uid = self.host_id_to_virtual_uid(st.st_uid)
+        gid = self.host_id_to_virtual_gid(st.st_gid)
+
+        if isinstance(virtual_path, str) and virtual_path in DEFAULT_SETUID_ROOT_PATHS:
+            mode |= stat_module.S_ISUID
+            uid = 0
+            gid = 0
+
+        return ExecutableIds(mode=mode, uid=uid, gid=gid)
+
+    def host_id_to_virtual_uid(self, uid: int) -> int:
+        if self.initial.ruid == 0 and uid == self.host_uid:
+            return 0
+        return uid
+
+    def host_id_to_virtual_gid(self, gid: int) -> int:
+        if self.initial.rgid == 0 and gid == self.host_gid:
+            return 0
+        return gid
+
+    def handle_getresuid(self, context: SyscallContext) -> None:
+        credentials = self.credentials(context.pid)
+        result = self.write_id_pointers(
+            context.pid,
+            [context.args[0], context.args[1], context.args[2]],
+            [credentials.ruid, credentials.euid, credentials.suid],
+        )
+        set_syscall_result(context, result)
+
+    def handle_getresgid(self, context: SyscallContext) -> None:
+        credentials = self.credentials(context.pid)
+        result = self.write_id_pointers(
+            context.pid,
+            [context.args[0], context.args[1], context.args[2]],
+            [credentials.rgid, credentials.egid, credentials.sgid],
+        )
+        set_syscall_result(context, result)
+
+    def write_id_pointers(
+        self, pid: int, addresses: list[int], values: list[int]
+    ) -> int:
+        try:
+            for address, value in zip(addresses, values):
+                if address == 0:
+                    return -errno.EFAULT
+                write_tracee_u32(pid, address, value)
+        except OSError:
+            return -errno.EFAULT
+        return 0
+
+    def handle_getgroups(self, context: SyscallContext) -> None:
+        size = signed64(context.args[0])
+        list_address = context.args[1]
+        groups = self.groups_by_pid.get(
+            context.pid, [self.credentials(context.pid).egid]
+        )
+
+        if size == 0:
+            set_syscall_result(context, len(groups))
+            return
+
+        if size < 0 or size < len(groups):
+            set_syscall_result(context, -errno.EINVAL)
+            return
+
+        if list_address == 0:
+            set_syscall_result(context, -errno.EFAULT)
+            return
+
+        try:
+            write_tracee_u32_array(context.pid, list_address, groups)
+        except OSError:
+            set_syscall_result(context, -errno.EFAULT)
+            return
+
+        set_syscall_result(context, len(groups))
+
+    def handle_uid_setter(
+        self, context: SyscallContext, record: SyscallRecord
+    ) -> None:
+        credentials = self.credentials(context.pid)
+        name = record.name
+
+        if name == "setuid":
+            result = self.apply_setuid(credentials, self.id_arg(record.args[0]))
+        elif name == "setreuid":
+            result = self.apply_setreuid(
+                credentials, self.id_arg(record.args[0]), self.id_arg(record.args[1])
+            )
+        elif name == "setresuid":
+            result = self.apply_setresuid(
+                credentials,
+                self.id_arg(record.args[0]),
+                self.id_arg(record.args[1]),
+                self.id_arg(record.args[2]),
+            )
+        elif name == "setfsuid":
+            result = credentials.fsuid
+            uid = self.id_arg(record.args[0])
+            if self.id_can_change(credentials, uid, "uid"):
+                credentials.fsuid = uid
+        else:
+            result = -errno.ENOSYS
+
+        set_syscall_result(context, result)
+
+    def handle_gid_setter(
+        self, context: SyscallContext, record: SyscallRecord
+    ) -> None:
+        credentials = self.credentials(context.pid)
+        name = record.name
+
+        if name == "setgid":
+            result = self.apply_setgid(credentials, self.id_arg(record.args[0]))
+        elif name == "setregid":
+            result = self.apply_setregid(
+                credentials, self.id_arg(record.args[0]), self.id_arg(record.args[1])
+            )
+        elif name == "setresgid":
+            result = self.apply_setresgid(
+                credentials,
+                self.id_arg(record.args[0]),
+                self.id_arg(record.args[1]),
+                self.id_arg(record.args[2]),
+            )
+        elif name == "setfsgid":
+            result = credentials.fsgid
+            gid = self.id_arg(record.args[0])
+            if self.id_can_change(credentials, gid, "gid"):
+                credentials.fsgid = gid
+        elif name == "setgroups":
+            result = self.apply_setgroups(context.pid, credentials, record)
+        else:
+            result = -errno.ENOSYS
+
+        set_syscall_result(context, result)
+
+    def apply_setuid(self, credentials: VirtualCredentials, uid: int) -> int:
+        if not self.valid_id(uid):
+            return -errno.EINVAL
+
+        if credentials.euid == 0:
+            credentials.ruid = uid
+            credentials.euid = uid
+            credentials.suid = uid
+            credentials.fsuid = uid
+            return 0
+
+        if uid in {credentials.ruid, credentials.euid, credentials.suid}:
+            credentials.euid = uid
+            credentials.fsuid = uid
+            return 0
+
+        return -errno.EPERM
+
+    def apply_setreuid(
+        self, credentials: VirtualCredentials, ruid: int, euid: int
+    ) -> int:
+        old = credentials.copy()
+        if not self.id_arg_or_none_is_valid(ruid) or not self.id_arg_or_none_is_valid(
+            euid
+        ):
+            return -errno.EINVAL
+
+        for uid in (ruid, euid):
+            if uid != NO_ID and not self.id_can_change(old, uid, "uid"):
+                return -errno.EPERM
+
+        if ruid != NO_ID:
+            credentials.ruid = ruid
+        if euid != NO_ID:
+            credentials.euid = euid
+            credentials.fsuid = euid
+        if old.euid == 0 or ruid != NO_ID or (euid != NO_ID and euid != old.ruid):
+            credentials.suid = credentials.euid
+
+        return 0
+
+    def apply_setresuid(
+        self, credentials: VirtualCredentials, ruid: int, euid: int, suid: int
+    ) -> int:
+        old = credentials.copy()
+        if not all(self.id_arg_or_none_is_valid(uid) for uid in (ruid, euid, suid)):
+            return -errno.EINVAL
+
+        for uid in (ruid, euid, suid):
+            if uid != NO_ID and not self.id_can_change(old, uid, "uid"):
+                return -errno.EPERM
+
+        if ruid != NO_ID:
+            credentials.ruid = ruid
+        if euid != NO_ID:
+            credentials.euid = euid
+            credentials.fsuid = euid
+        if suid != NO_ID:
+            credentials.suid = suid
+
+        return 0
+
+    def apply_setgid(self, credentials: VirtualCredentials, gid: int) -> int:
+        if not self.valid_id(gid):
+            return -errno.EINVAL
+
+        if credentials.euid == 0:
+            credentials.rgid = gid
+            credentials.egid = gid
+            credentials.sgid = gid
+            credentials.fsgid = gid
+            return 0
+
+        if gid in {credentials.rgid, credentials.egid, credentials.sgid}:
+            credentials.egid = gid
+            credentials.fsgid = gid
+            return 0
+
+        return -errno.EPERM
+
+    def apply_setregid(
+        self, credentials: VirtualCredentials, rgid: int, egid: int
+    ) -> int:
+        old = credentials.copy()
+        if not self.id_arg_or_none_is_valid(rgid) or not self.id_arg_or_none_is_valid(
+            egid
+        ):
+            return -errno.EINVAL
+
+        for gid in (rgid, egid):
+            if gid != NO_ID and not self.id_can_change(old, gid, "gid"):
+                return -errno.EPERM
+
+        if rgid != NO_ID:
+            credentials.rgid = rgid
+        if egid != NO_ID:
+            credentials.egid = egid
+            credentials.fsgid = egid
+        if old.euid == 0 or rgid != NO_ID or (egid != NO_ID and egid != old.rgid):
+            credentials.sgid = credentials.egid
+
+        return 0
+
+    def apply_setresgid(
+        self, credentials: VirtualCredentials, rgid: int, egid: int, sgid: int
+    ) -> int:
+        old = credentials.copy()
+        if not all(self.id_arg_or_none_is_valid(gid) for gid in (rgid, egid, sgid)):
+            return -errno.EINVAL
+
+        for gid in (rgid, egid, sgid):
+            if gid != NO_ID and not self.id_can_change(old, gid, "gid"):
+                return -errno.EPERM
+
+        if rgid != NO_ID:
+            credentials.rgid = rgid
+        if egid != NO_ID:
+            credentials.egid = egid
+            credentials.fsgid = egid
+        if sgid != NO_ID:
+            credentials.sgid = sgid
+
+        return 0
+
+    def apply_setgroups(
+        self, pid: int, credentials: VirtualCredentials, record: SyscallRecord
+    ) -> int:
+        size = signed64(record.args[0])
+        list_address = record.args[1]
+
+        if credentials.euid != 0:
+            return -errno.EPERM
+        if size < 0:
+            return -errno.EINVAL
+        if size > 0 and list_address == 0:
+            return -errno.EFAULT
+
+        try:
+            groups = (
+                read_tracee_u32_array(pid, list_address, size)
+                if size > 0
+                else []
+            )
+        except OSError:
+            return -errno.EFAULT
+
+        if any(not self.valid_id(group) for group in groups):
+            return -errno.EINVAL
+
+        self.groups_by_pid[pid] = groups
+        return 0
+
+    def id_can_change(
+        self, credentials: VirtualCredentials, value: int, kind: str
+    ) -> bool:
+        if not self.valid_id(value):
+            return False
+        if credentials.euid == 0:
+            return True
+        if kind == "uid":
+            return value in {credentials.ruid, credentials.euid, credentials.suid}
+        return value in {credentials.rgid, credentials.egid, credentials.sgid}
+
+    @staticmethod
+    def id_arg(value: int) -> int:
+        return value & NO_ID
+
+    @staticmethod
+    def valid_id(value: int) -> bool:
+        return 0 <= value < NO_ID
+
+    def id_arg_or_none_is_valid(self, value: int) -> bool:
+        return value == NO_ID or self.valid_id(value)
 
 
 class VirtualRoot:
@@ -667,6 +1197,10 @@ class VirtualRoot:
                 if flags & O_DIRECTORY or os.path.isdir(host_path):
                     metadata["opened_dir_virtual_path"] = virtual_path
 
+            if name in {"execve", "execveat"} and spec.path_index in {0, 1}:
+                metadata["exec_virtual_path"] = virtual_path
+                metadata["exec_host_path"] = host_path
+
         if changed:
             set_regs(pid, regs)
             metadata["rewritten_paths"] = rewritten_paths
@@ -745,6 +1279,7 @@ class VirtualRoot:
 
 
 ROOTFS: VirtualRoot | None = None
+VIRTUAL_IDS: VirtualIds | None = None
 
 
 def trace_log(message: str, *, file=sys.stdout) -> None:
@@ -784,7 +1319,9 @@ def syscall_entry(pid: int) -> SyscallRecord:
     ]
     metadata: dict[str, object] = {}
     if ROOTFS is not None:
-        metadata = ROOTFS.rewrite_syscall_entry(pid, name, args, regs)
+        metadata.update(ROOTFS.rewrite_syscall_entry(pid, name, args, regs))
+    if VIRTUAL_IDS is not None:
+        metadata.update(VIRTUAL_IDS.neutralize_syscall(pid, name, regs))
 
     rendered_args = format_syscall_args(pid, name, args)
     dispatch_syscall_handlers(
@@ -839,6 +1376,8 @@ def syscall_exit(pid: int, record: SyscallRecord | None) -> None:
     )
     if ROOTFS is not None:
         ROOTFS.handle_syscall_exit(context, record)
+    if VIRTUAL_IDS is not None:
+        VIRTUAL_IDS.handle_syscall_exit(context, record)
 
     dispatch_syscall_handlers(context)
 
@@ -870,6 +1409,9 @@ def trace(initial_pids: set[int]) -> int:
     if ROOTFS is not None:
         for pid in initial_pids:
             ROOTFS.register_pid(pid)
+    if VIRTUAL_IDS is not None:
+        for pid in initial_pids:
+            VIRTUAL_IDS.register_pid(pid)
 
     alive = set(initial_pids)
     configured: set[int] = set()
@@ -898,6 +1440,8 @@ def trace(initial_pids: set[int]) -> int:
                 active_syscalls.pop(pid, None)
                 if ROOTFS is not None:
                     ROOTFS.drop_pid(pid)
+                if VIRTUAL_IDS is not None:
+                    VIRTUAL_IDS.drop_pid(pid)
                 if not alive:
                     exit_code = code
                 continue
@@ -911,6 +1455,8 @@ def trace(initial_pids: set[int]) -> int:
                 active_syscalls.pop(pid, None)
                 if ROOTFS is not None:
                     ROOTFS.drop_pid(pid)
+                if VIRTUAL_IDS is not None:
+                    VIRTUAL_IDS.drop_pid(pid)
                 if not alive:
                     exit_code = 128 + sig
                 continue
@@ -949,6 +1495,8 @@ def trace(initial_pids: set[int]) -> int:
                     in_syscall[child_pid] = False
                     if ROOTFS is not None:
                         ROOTFS.inherit_pid(pid, child_pid)
+                    if VIRTUAL_IDS is not None:
+                        VIRTUAL_IDS.inherit_pid(pid, child_pid)
                     event_name = {
                         PTRACE_EVENT_FORK: "fork",
                         PTRACE_EVENT_VFORK: "vfork",
@@ -978,6 +1526,17 @@ def trace(initial_pids: set[int]) -> int:
     return exit_code
 
 
+def parse_virtual_id(value: str) -> int:
+    try:
+        parsed = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid id: {value}") from exc
+
+    if not 0 <= parsed < NO_ID:
+        raise argparse.ArgumentTypeError(f"id must be between 0 and {NO_ID - 1}")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Trace Linux syscalls with ptrace and follow fork/vfork/clone children."
@@ -997,6 +1556,16 @@ def parse_args() -> argparse.Namespace:
         help="suppress tracer logs and leave only the traced program output",
     )
     parser.add_argument(
+        "--uid",
+        type=parse_virtual_id,
+        help="virtual uid visible to the traced process",
+    )
+    parser.add_argument(
+        "--gid",
+        type=parse_virtual_id,
+        help="virtual gid visible to the traced process; defaults to --uid if set",
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="command to run under tracing; use '--' before the command",
@@ -1014,6 +1583,11 @@ def parse_args() -> argparse.Namespace:
         if not os.path.isdir(args.rootfs):
             parser.error(f"--rootfs must be an existing directory: {args.rootfs}")
 
+    if args.uid is not None and args.gid is None:
+        args.gid = args.uid
+    elif args.uid is None and args.gid is not None:
+        args.uid = os.getuid()
+
     return args
 
 
@@ -1026,12 +1600,17 @@ def ensure_supported_architecture() -> None:
 
 
 def main() -> int:
-    global ROOTFS, TRACE_LOGGING
+    global ROOTFS, TRACE_LOGGING, VIRTUAL_IDS
 
     ensure_supported_architecture()
     args = parse_args()
     TRACE_LOGGING = not args.quiet
     ROOTFS = VirtualRoot(args.rootfs) if args.rootfs is not None else None
+    VIRTUAL_IDS = (
+        VirtualIds(args.uid, args.gid)
+        if args.uid is not None and args.gid is not None
+        else None
+    )
     return trace({launch_tracee(args.command, ROOTFS)})
 
 
