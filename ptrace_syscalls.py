@@ -52,6 +52,7 @@ from virtual_network import (
     VirtualNetworkRuntime,
     generate_container_id,
     parse_netdev,
+    parse_publish,
 )
 from virtual_paths import BindMount, VirtualRoot
 
@@ -508,6 +509,18 @@ def parse_args() -> argparse.Namespace:
         help="Unix stream socket path for the external virtual network service",
     )
     parser.add_argument(
+        "-p",
+        "--publish",
+        action="append",
+        default=[],
+        type=parse_publish,
+        metavar="[HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
+        help=(
+            "publish a container TCP port on the host through netservice; "
+            "repeatable, default HOST_IP is 127.0.0.1"
+        ),
+    )
+    parser.add_argument(
         "--container-id",
         help="stable container id sent to the virtual network service",
     )
@@ -538,6 +551,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.netdev and not args.netservice:
         parser.error("--netdev requires --netservice")
+    if args.publish and not args.netdev:
+        parser.error("--publish requires --netdev")
 
     if args.netservice is not None:
         args.netservice = os.path.abspath(args.netservice)
@@ -553,6 +568,7 @@ def parse_args() -> argparse.Namespace:
             container_id=args.container_id,
             interfaces=args.netdev,
             service_socket=args.netservice,
+            published_ports=args.publish,
         )
     else:
         args.network_config = None

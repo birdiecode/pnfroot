@@ -129,10 +129,27 @@ class VirtualNetworkInterface:
 
 
 @dataclass
+class PublishedPort:
+    host_ip: str
+    host_port: int
+    container_port: int
+    protocol: str = "tcp"
+
+    def to_message(self) -> dict[str, object]:
+        return {
+            "host_ip": self.host_ip,
+            "host_port": self.host_port,
+            "container_port": self.container_port,
+            "protocol": self.protocol,
+        }
+
+
+@dataclass
 class ContainerNetworkConfig:
     container_id: str
     interfaces: list[VirtualNetworkInterface]
     service_socket: str
+    published_ports: list[PublishedPort] = field(default_factory=list)
 
     def interface_for_destination(
         self, destination_ip: str | None
@@ -349,6 +366,10 @@ class NetworkServiceClient:
             "container_id": config.container_id,
             "pid": pid,
             "interfaces": [interface.to_message() for interface in config.interfaces],
+            "published_ports": [
+                published_port.to_message()
+                for published_port in config.published_ports
+            ],
         }
         response = self.request(message)
         if not response.get("success", False):
@@ -1120,6 +1141,61 @@ def parse_netdev(value: str) -> VirtualNetworkInterface:
         mtu=mtu,
         dns_servers=dns_servers,
     )
+
+
+def parse_publish(value: str) -> PublishedPort:
+    address_part, protocol = split_publish_protocol(value)
+    pieces = address_part.split(":")
+    if len(pieces) == 2:
+        host_ip = "127.0.0.1"
+        host_port_text, container_port_text = pieces
+    elif len(pieces) == 3:
+        host_ip, host_port_text, container_port_text = pieces
+    else:
+        raise argparse.ArgumentTypeError(
+            "--publish must be HOST_PORT:CONTAINER_PORT or "
+            "HOST_IP:HOST_PORT:CONTAINER_PORT"
+        )
+
+    if protocol != "tcp":
+        raise argparse.ArgumentTypeError("--publish currently supports only tcp")
+
+    try:
+        ipaddress.IPv4Address(host_ip)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid --publish host IP: {host_ip}") from exc
+
+    host_port = parse_tcp_port(host_port_text, "--publish host port")
+    container_port = parse_tcp_port(
+        container_port_text,
+        "--publish container port",
+    )
+    return PublishedPort(
+        host_ip=host_ip,
+        host_port=host_port,
+        container_port=container_port,
+        protocol=protocol,
+    )
+
+
+def split_publish_protocol(value: str) -> tuple[str, str]:
+    if "/" not in value:
+        return value, "tcp"
+    address_part, protocol = value.rsplit("/", 1)
+    protocol = protocol.strip().lower()
+    if not address_part or not protocol:
+        raise argparse.ArgumentTypeError(f"invalid --publish value: {value}")
+    return address_part, protocol
+
+
+def parse_tcp_port(value: str, label: str) -> int:
+    try:
+        port = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid {label}: {value}") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"{label} must be between 1 and 65535")
+    return port
 
 
 def split_dns_servers(value: str) -> list[str]:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import ipaddress
 import os
 import socket
@@ -11,13 +12,47 @@ import stat
 import sys
 import threading
 import uuid
+from dataclasses import dataclass
 
 if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from netservice.protocol import ProtocolError, read_message, write_message
-from netservice.registry import RegistryError, VirtualNetworkRegistry
-from netservice.tcp_proxy import TcpProxyManager
+from netservice.registry import PortMapping, RegistryError, VirtualNetworkRegistry
+from netservice.tcp_proxy import TcpForwarder, TcpProxyManager
+
+
+@dataclass
+class PublishRule:
+    container_id: str
+    host_ip: str
+    host_port: int
+    container_port: int
+    protocol: str
+
+    def key(self) -> tuple[str, str, int, int, str]:
+        return (
+            self.container_id,
+            self.host_ip,
+            self.host_port,
+            self.container_port,
+            self.protocol,
+        )
+
+    def to_message(self) -> dict[str, object]:
+        return {
+            "host_ip": self.host_ip,
+            "host_port": self.host_port,
+            "container_port": self.container_port,
+            "protocol": self.protocol,
+        }
+
+
+@dataclass
+class ActivePublish:
+    rule: PublishRule
+    mapping: PortMapping
+    forwarder: TcpForwarder
 
 
 class VirtualNetworkService:
@@ -33,6 +68,9 @@ class VirtualNetworkService:
         self.internet_networks = set(internet_networks or set())
         self.registry = VirtualNetworkRegistry()
         self.proxy_manager = TcpProxyManager()
+        self.publish_rules: dict[str, list[PublishRule]] = {}
+        self.active_publishes: dict[tuple[str, str, int, int, str], ActivePublish] = {}
+        self._publish_lock = threading.RLock()
         self.listener: socket.socket | None = None
         self._stop = threading.Event()
 
@@ -55,6 +93,7 @@ class VirtualNetworkService:
                 thread.daemon = True
                 thread.start()
         finally:
+            self.stop_all_published_ports()
             listener.close()
             try:
                 os.unlink(self.socket_path)
@@ -134,25 +173,44 @@ class VirtualNetworkService:
         interfaces = message.get("interfaces")
         if not isinstance(interfaces, list):
             raise ValueError("interfaces must be a list")
+        publish_rules = parse_publish_rules(
+            container_id,
+            message.get("published_ports", []),
+        )
+        self.remove_published_ports(container_id)
         records = self.registry.register_container(container_id, pid, interfaces)
+        with self._publish_lock:
+            self.publish_rules[container_id] = publish_rules
         self.log(
             "registered "
             + container_id
             + " "
             + ", ".join(f"{item.network}/{item.name}/{item.ip}" for item in records)
         )
+        if publish_rules:
+            self.log(
+                "publish "
+                + container_id
+                + " "
+                + ", ".join(
+                    f"{rule.host_ip}:{rule.host_port}->{rule.container_port}/{rule.protocol}"
+                    for rule in publish_rules
+                )
+            )
         return {
             "version": 1,
             "type": "register_container_result",
             "success": True,
             "container_id": container_id,
             "interfaces": [record.to_message() for record in records],
+            "published_ports": [rule.to_message() for rule in publish_rules],
         }
 
     def handle_unregister_container(
         self, message: dict[str, object]
     ) -> dict[str, object]:
         container_id = require_string(message, "container_id")
+        self.remove_published_ports(container_id)
         self.registry.unregister_container(container_id)
         self.log(f"unregistered {container_id}")
         return {
@@ -165,14 +223,20 @@ class VirtualNetworkService:
     def handle_bind_request(self, message: dict[str, object]) -> dict[str, object]:
         request_id = require_string(message, "request_id")
         virtual_address = require_dict(message, "virtual_address")
+        container_id = require_string(message, "container_id")
         mapping = self.registry.bind_port(
-            container_id=require_string(message, "container_id"),
+            container_id=container_id,
             interface_name=require_string(message, "interface"),
             network_name=require_string(message, "network"),
             virtual_ip=require_string(virtual_address, "ip"),
             virtual_port=require_int(virtual_address, "port"),
             protocol=require_string(message, "protocol"),
         )
+        try:
+            self.activate_published_ports(mapping)
+        except RegistryError:
+            self.registry.release_port_mapping(mapping)
+            raise
         self.log(
             f"bind {mapping.network}/{mapping.virtual_ip}:{mapping.virtual_port} "
             f"-> {mapping.real_ip}:{mapping.real_port}"
@@ -259,6 +323,74 @@ class VirtualNetworkService:
             },
         }
 
+    def activate_published_ports(self, mapping: PortMapping) -> None:
+        with self._publish_lock:
+            rules = [
+                rule
+                for rule in self.publish_rules.get(mapping.container_id, [])
+                if (
+                    rule.container_port == mapping.virtual_port
+                    and rule.protocol == mapping.protocol
+                )
+            ]
+            started: list[PublishRule] = []
+            try:
+                for rule in rules:
+                    key = rule.key()
+                    if key in self.active_publishes:
+                        continue
+                    forwarder_id = (
+                        f"pub-{mapping.container_id}-"
+                        f"{rule.host_ip}-{rule.host_port}-{rule.container_port}"
+                    )
+                    forwarder, address = self.proxy_manager.create_forwarder(
+                        forwarder_id=forwarder_id,
+                        listen_host=rule.host_ip,
+                        listen_port=rule.host_port,
+                        target_host=mapping.real_ip,
+                        target_port=mapping.real_port,
+                    )
+                    self.active_publishes[key] = ActivePublish(
+                        rule=rule,
+                        mapping=mapping,
+                        forwarder=forwarder,
+                    )
+                    started.append(rule)
+                    self.log(
+                        f"published {address[0]}:{address[1]} -> "
+                        f"{mapping.network}/{mapping.virtual_ip}:{mapping.virtual_port} "
+                        f"({mapping.real_ip}:{mapping.real_port})"
+                    )
+            except OSError as exc:
+                for rule in started:
+                    self.deactivate_published_port(rule.key())
+                errno_name = errno.errorcode.get(exc.errno or errno.EADDRINUSE, "EADDRINUSE")
+                raise RegistryError(f"host port publish failed: {exc}", errno_name) from exc
+
+    def remove_published_ports(self, container_id: str) -> None:
+        with self._publish_lock:
+            for key in [
+                key
+                for key in self.active_publishes
+                if key[0] == container_id
+            ]:
+                self.deactivate_published_port(key)
+            self.publish_rules.pop(container_id, None)
+
+    def stop_all_published_ports(self) -> None:
+        with self._publish_lock:
+            for key in list(self.active_publishes):
+                self.deactivate_published_port(key)
+            self.publish_rules.clear()
+
+    def deactivate_published_port(
+        self,
+        key: tuple[str, str, int, int, str],
+    ) -> None:
+        active = self.active_publishes.pop(key, None)
+        if active is not None:
+            active.forwarder.stop()
+
     def allow_internet_egress(
         self,
         container_id: str,
@@ -332,6 +464,60 @@ def require_dict(data: dict[str, object], key: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"missing field: {key}")
     return value
+
+
+def parse_publish_rules(container_id: str, value: object) -> list[PublishRule]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("published_ports must be a list")
+
+    rules: list[PublishRule] = []
+    seen_host_ports: set[tuple[str, int, str]] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("published port must be an object")
+        host_ip = require_string(item, "host_ip")
+        host_port = require_int(item, "host_port")
+        container_port = require_int(item, "container_port")
+        protocol_value = item.get("protocol", "tcp")
+        if not isinstance(protocol_value, str) or not protocol_value:
+            raise ValueError("missing field: protocol")
+        protocol = protocol_value.lower()
+
+        validate_publish_ip(host_ip)
+        validate_publish_port(host_port, "host_port")
+        validate_publish_port(container_port, "container_port")
+        if protocol != "tcp":
+            raise ValueError("published ports currently support only tcp")
+
+        host_key = (host_ip, host_port, protocol)
+        if host_key in seen_host_ports:
+            raise ValueError(f"duplicate published host port: {host_ip}:{host_port}")
+        seen_host_ports.add(host_key)
+
+        rules.append(
+            PublishRule(
+                container_id=container_id,
+                host_ip=host_ip,
+                host_port=host_port,
+                container_port=container_port,
+                protocol=protocol,
+            )
+        )
+    return rules
+
+
+def validate_publish_ip(value: str) -> None:
+    try:
+        ipaddress.IPv4Address(value)
+    except ValueError as exc:
+        raise ValueError(f"invalid published host IP: {value}") from exc
+
+
+def validate_publish_port(value: int, name: str) -> None:
+    if not 1 <= value <= 65535:
+        raise ValueError(f"{name} must be between 1 and 65535")
 
 
 def parse_args() -> argparse.Namespace:

@@ -39,6 +39,34 @@ Run a container with one virtual interface:
   -- ./app
 ```
 
+Publish a TCP port from the container to the host:
+
+```bash
+./ptrace_syscalls.py \
+  --container-id web-01 \
+  --rootfs ./ubuntu_c \
+  --netdev 'name=eth0,network=testnet' \
+  --netservice /tmp/net.unix \
+  --publish 18080:8000 \
+  -- python3 -m http.server 8000 --bind 0.0.0.0
+```
+
+Then connect from the host:
+
+```bash
+curl http://127.0.0.1:18080/
+```
+
+`--publish` is repeatable and accepts:
+
+```text
+HOST_PORT:CONTAINER_PORT
+HOST_IP:HOST_PORT:CONTAINER_PORT
+HOST_PORT:CONTAINER_PORT/tcp
+```
+
+The default host IP is `127.0.0.1`. UDP publishing is not implemented yet.
+
 The runtime is quiet by default. Add `--log` or `--verbose` to print traced
 syscalls. Use service-side `--log` to see route, bind, proxy, and deny decisions.
 The old `--quiet` option is accepted for compatibility, but quiet mode is
@@ -159,6 +187,9 @@ The prototype is intentionally minimal:
   `--internet-networks`. Without it, a connection such as `curl 8.8.8.8` is
   denied unless that destination is represented by a registered virtual
   container port and route.
+* Host port publishing is implemented for IPv4 TCP via runtime-side
+  `--publish`. The service starts the host listener when the container calls
+  `bind` for the matching virtual container port.
 * There is no virtual DNS proxy yet.
 * Minimal rtnetlink interface discovery for `ip a` is implemented. Broader
   netlink families/messages, `ioctl(SIOCGIF*)`, `/proc/net/*`, and

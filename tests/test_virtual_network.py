@@ -11,6 +11,7 @@ from virtual_network import (
     RTM_GETLINK,
     build_rtnetlink_response,
     parse_netdev,
+    parse_publish,
 )
 
 
@@ -44,6 +45,27 @@ class ParseNetdevTests(unittest.TestCase):
             parse_netdev("name=eth0")
         with self.assertRaises(argparse.ArgumentTypeError):
             parse_netdev("network=backend")
+
+
+class ParsePublishTests(unittest.TestCase):
+    def test_parse_host_and_container_port(self) -> None:
+        published_port = parse_publish("18080:8080")
+
+        self.assertEqual(published_port.host_ip, "127.0.0.1")
+        self.assertEqual(published_port.host_port, 18080)
+        self.assertEqual(published_port.container_port, 8080)
+        self.assertEqual(published_port.protocol, "tcp")
+
+    def test_parse_host_ip(self) -> None:
+        published_port = parse_publish("0.0.0.0:18080:8080/tcp")
+
+        self.assertEqual(published_port.host_ip, "0.0.0.0")
+        self.assertEqual(published_port.host_port, 18080)
+        self.assertEqual(published_port.container_port, 8080)
+
+    def test_rejects_udp(self) -> None:
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_publish("18080:8080/udp")
 
 
 class RtnetlinkDumpTests(unittest.TestCase):

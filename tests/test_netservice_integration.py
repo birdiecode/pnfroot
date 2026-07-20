@@ -11,6 +11,7 @@ from netservice.server import VirtualNetworkService, parse_network_list
 from virtual_network import (
     ContainerNetworkConfig,
     NetworkServiceClient,
+    PublishedPort,
     VirtualNetworkInterface,
 )
 
@@ -113,6 +114,73 @@ class NetserviceIntegrationTests(unittest.TestCase):
                 app_client.unregister_container("app-01")
                 db_client.close()
                 app_client.close()
+                service.stop()
+                poke_unix_socket(socket_path)
+                service_thread.join(timeout=2)
+
+    def test_publishes_container_port_on_host(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "net.unix")
+            host_port = reserve_local_port()
+            service = VirtualNetworkService(socket_path, quiet=True)
+            service_thread = threading.Thread(target=service.serve_forever)
+            service_thread.daemon = True
+            service_thread.start()
+            wait_for_path(socket_path)
+
+            client = NetworkServiceClient(socket_path)
+            try:
+                config = ContainerNetworkConfig(
+                    container_id="web-01",
+                    service_socket=socket_path,
+                    interfaces=[
+                        VirtualNetworkInterface(
+                            name="eth0",
+                            network="testnet",
+                            ip_address="10.50.0.30",
+                            prefix_length=24,
+                        )
+                    ],
+                    published_ports=[
+                        PublishedPort(
+                            host_ip="127.0.0.1",
+                            host_port=host_port,
+                            container_port=8080,
+                        )
+                    ],
+                )
+                client.register_container(config, 1003)
+
+                bind_response = client.request(
+                    {
+                        "version": 1,
+                        "type": "bind_request",
+                        "request_id": "req-bind-publish",
+                        "container_id": "web-01",
+                        "pid": 1003,
+                        "fd": 5,
+                        "protocol": "tcp",
+                        "interface": "eth0",
+                        "network": "testnet",
+                        "virtual_address": {
+                            "ip": "10.50.0.30",
+                            "port": 8080,
+                        },
+                    }
+                )
+                real_address = bind_response["real_address"]
+                server_thread = start_echo_server(
+                    real_address["ip"],
+                    real_address["port"],
+                )
+
+                with socket.create_connection(("127.0.0.1", host_port), timeout=5) as sock:
+                    sock.sendall(b"publish")
+                    self.assertEqual(sock.recv(1024), b"echo:publish")
+                server_thread.join(timeout=2)
+            finally:
+                client.unregister_container("web-01")
+                client.close()
                 service.stop()
                 poke_unix_socket(socket_path)
                 service_thread.join(timeout=2)
@@ -339,6 +407,15 @@ def start_echo_server(host: str, port: int) -> threading.Thread:
     if not self_ready:
         raise TimeoutError("echo server did not start")
     return thread
+
+
+def reserve_local_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+    finally:
+        sock.close()
 
 
 def poke_unix_socket(path: str) -> None:

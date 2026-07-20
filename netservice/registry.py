@@ -208,6 +208,10 @@ class VirtualNetworkRegistry:
             self.ports[key] = mapping
             return mapping
 
+    def release_port_mapping(self, mapping: PortMapping) -> None:
+        with self._lock:
+            self.ports.pop(mapping.virtual_key(), None)
+
     def route_connect(
         self,
         container_id: str,
