@@ -7,7 +7,7 @@ import threading
 import time
 import unittest
 
-from netservice.server import VirtualNetworkService
+from netservice.server import VirtualNetworkService, parse_network_list
 from virtual_network import (
     ContainerNetworkConfig,
     NetworkServiceClient,
@@ -116,6 +116,193 @@ class NetserviceIntegrationTests(unittest.TestCase):
                 service.stop()
                 poke_unix_socket(socket_path)
                 service_thread.join(timeout=2)
+
+    def test_allows_internet_egress_for_configured_network(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "net.unix")
+            service = VirtualNetworkService(
+                socket_path,
+                quiet=True,
+                internet_networks={"testnet"},
+            )
+            service_thread = threading.Thread(target=service.serve_forever)
+            service_thread.daemon = True
+            service_thread.start()
+            wait_for_path(socket_path)
+
+            client = NetworkServiceClient(socket_path)
+            try:
+                config = ContainerNetworkConfig(
+                    container_id="app-01",
+                    service_socket=socket_path,
+                    interfaces=[
+                        VirtualNetworkInterface(
+                            name="eth0",
+                            network="testnet",
+                            ip_address="10.50.0.10",
+                            prefix_length=24,
+                        )
+                    ],
+                )
+                client.register_container(config, 1002)
+
+                response = client.request(
+                    {
+                        "version": 1,
+                        "type": "connect_request",
+                        "request_id": "req-internet",
+                        "container_id": "app-01",
+                        "pid": 1002,
+                        "tid": 1002,
+                        "fd": 7,
+                        "protocol": "tcp",
+                        "address_family": "ipv4",
+                        "source": {
+                            "interface": "eth0",
+                            "network": "testnet",
+                            "ip": "10.50.0.10",
+                            "port": 0,
+                        },
+                        "destination": {
+                            "ip": "8.8.8.8",
+                            "port": 80,
+                        },
+                    }
+                )
+
+                self.assertEqual(response["action"], "allow")
+            finally:
+                client.unregister_container("app-01")
+                client.close()
+                service.stop()
+                poke_unix_socket(socket_path)
+                service_thread.join(timeout=2)
+
+    def test_denies_internet_egress_for_unconfigured_network(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "net.unix")
+            service = VirtualNetworkService(socket_path, quiet=True)
+            service_thread = threading.Thread(target=service.serve_forever)
+            service_thread.daemon = True
+            service_thread.start()
+            wait_for_path(socket_path)
+
+            client = NetworkServiceClient(socket_path)
+            try:
+                config = ContainerNetworkConfig(
+                    container_id="app-01",
+                    service_socket=socket_path,
+                    interfaces=[
+                        VirtualNetworkInterface(
+                            name="eth0",
+                            network="testnet",
+                            ip_address="10.50.0.10",
+                            prefix_length=24,
+                        )
+                    ],
+                )
+                client.register_container(config, 1002)
+
+                response = client.request(
+                    {
+                        "version": 1,
+                        "type": "connect_request",
+                        "request_id": "req-no-internet",
+                        "container_id": "app-01",
+                        "pid": 1002,
+                        "tid": 1002,
+                        "fd": 7,
+                        "protocol": "tcp",
+                        "address_family": "ipv4",
+                        "source": {
+                            "interface": "eth0",
+                            "network": "testnet",
+                            "ip": "10.50.0.10",
+                            "port": 0,
+                        },
+                        "destination": {
+                            "ip": "8.8.8.8",
+                            "port": 80,
+                        },
+                    }
+                )
+
+                self.assertEqual(response["action"], "deny")
+                self.assertEqual(response["errno"], "EHOSTUNREACH")
+            finally:
+                client.unregister_container("app-01")
+                client.close()
+                service.stop()
+                poke_unix_socket(socket_path)
+                service_thread.join(timeout=2)
+
+    def test_does_not_treat_unregistered_virtual_ip_as_internet(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "net.unix")
+            service = VirtualNetworkService(
+                socket_path,
+                quiet=True,
+                internet_networks={"testnet"},
+            )
+            service_thread = threading.Thread(target=service.serve_forever)
+            service_thread.daemon = True
+            service_thread.start()
+            wait_for_path(socket_path)
+
+            client = NetworkServiceClient(socket_path)
+            try:
+                config = ContainerNetworkConfig(
+                    container_id="app-01",
+                    service_socket=socket_path,
+                    interfaces=[
+                        VirtualNetworkInterface(
+                            name="eth0",
+                            network="testnet",
+                            ip_address="10.50.0.10",
+                            prefix_length=24,
+                        )
+                    ],
+                )
+                client.register_container(config, 1002)
+
+                response = client.request(
+                    {
+                        "version": 1,
+                        "type": "connect_request",
+                        "request_id": "req-virtual-miss",
+                        "container_id": "app-01",
+                        "pid": 1002,
+                        "tid": 1002,
+                        "fd": 7,
+                        "protocol": "tcp",
+                        "address_family": "ipv4",
+                        "source": {
+                            "interface": "eth0",
+                            "network": "testnet",
+                            "ip": "10.50.0.10",
+                            "port": 0,
+                        },
+                        "destination": {
+                            "ip": "10.50.0.99",
+                            "port": 80,
+                        },
+                    }
+                )
+
+                self.assertEqual(response["action"], "deny")
+                self.assertEqual(response["errno"], "EHOSTUNREACH")
+            finally:
+                client.unregister_container("app-01")
+                client.close()
+                service.stop()
+                poke_unix_socket(socket_path)
+                service_thread.join(timeout=2)
+
+    def test_parses_internet_network_list(self) -> None:
+        self.assertEqual(
+            parse_network_list(["frontend, backend", "backend,database"]),
+            {"frontend", "backend", "database"},
+        )
 
 
 def wait_for_path(path: str) -> None:

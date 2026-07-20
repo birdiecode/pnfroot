@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import socket
 import stat
@@ -20,9 +21,16 @@ from netservice.tcp_proxy import TcpProxyManager
 
 
 class VirtualNetworkService:
-    def __init__(self, socket_path: str, *, quiet: bool = True) -> None:
+    def __init__(
+        self,
+        socket_path: str,
+        *,
+        quiet: bool = True,
+        internet_networks: set[str] | None = None,
+    ) -> None:
         self.socket_path = socket_path
         self.quiet = quiet
+        self.internet_networks = set(internet_networks or set())
         self.registry = VirtualNetworkRegistry()
         self.proxy_manager = TcpProxyManager()
         self.listener: socket.socket | None = None
@@ -182,20 +190,41 @@ class VirtualNetworkService:
 
     def handle_connect_request(self, message: dict[str, object]) -> dict[str, object]:
         request_id = require_string(message, "request_id")
+        container_id = require_string(message, "container_id")
         source = require_dict(message, "source")
         destination = require_dict(message, "destination")
+        network_name = require_string(source, "network")
+        destination_ip = require_string(destination, "ip")
+        destination_port = require_int(destination, "port")
+        protocol = require_string(message, "protocol")
         try:
             mapping = self.registry.route_connect(
-                container_id=require_string(message, "container_id"),
-                network_name=require_string(source, "network"),
-                destination_ip=require_string(destination, "ip"),
-                destination_port=require_int(destination, "port"),
-                protocol=require_string(message, "protocol"),
+                container_id=container_id,
+                network_name=network_name,
+                destination_ip=destination_ip,
+                destination_port=destination_port,
+                protocol=protocol,
             )
         except RegistryError as exc:
+            if self.allow_internet_egress(
+                container_id,
+                network_name,
+                destination_ip,
+                protocol,
+            ):
+                self.log(
+                    f"connect allowed internet {container_id} "
+                    f"{network_name} -> {destination_ip}:{destination_port}"
+                )
+                return {
+                    "version": 1,
+                    "type": "connect_result",
+                    "request_id": request_id,
+                    "action": "allow",
+                }
             self.log(
-                f"connect denied {message.get('container_id')} -> "
-                f"{destination.get('ip')}:{destination.get('port')} "
+                f"connect denied {container_id} -> "
+                f"{destination_ip}:{destination_port} "
                 f"{exc.errno_name} {exc}"
             )
             return {
@@ -229,6 +258,31 @@ class VirtualNetworkService:
                 "port": proxy_port,
             },
         }
+
+    def allow_internet_egress(
+        self,
+        container_id: str,
+        network_name: str,
+        destination_ip: str,
+        protocol: str,
+    ) -> bool:
+        if network_name not in self.internet_networks or protocol != "tcp":
+            return False
+
+        self.registry.ensure_source_network(container_id, network_name)
+        if self.registry.destination_inside_network(network_name, destination_ip):
+            return False
+        try:
+            address = ipaddress.ip_address(destination_ip)
+        except ValueError:
+            return False
+
+        return not (
+            address.is_loopback
+            or address.is_multicast
+            or address.is_unspecified
+            or address.is_link_local
+        )
 
     def log(self, message: str) -> None:
         if not self.quiet:
@@ -300,6 +354,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="enable service logs",
     )
+    parser.add_argument(
+        "--internet-networks",
+        action="append",
+        default=[],
+        metavar="NETWORK[,NETWORK...]",
+        help=(
+            "comma-separated logical networks allowed to connect to non-virtual "
+            "destinations through the host network"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -308,6 +372,7 @@ def main() -> int:
     service = VirtualNetworkService(
         os.path.abspath(args.socket),
         quiet=not args.verbose,
+        internet_networks=parse_network_list(args.internet_networks),
     )
     try:
         service.serve_forever()
@@ -315,6 +380,16 @@ def main() -> int:
         service.stop()
         return 130
     return 0
+
+
+def parse_network_list(values: list[str]) -> set[str]:
+    networks: set[str] = set()
+    for value in values:
+        for item in value.split(","):
+            network = item.strip()
+            if network:
+                networks.add(network)
+    return networks
 
 
 if __name__ == "__main__":

@@ -15,6 +15,19 @@ python3 -m netservice.server --socket /tmp/net.unix
 Add `--log` or `--verbose` to print service registration, bind, and connect
 decisions.
 
+Allow selected logical networks to reach non-virtual IP destinations through the
+host network:
+
+```bash
+python3 -m netservice.server \
+  --socket /tmp/net.unix \
+  --internet-networks backend,frontend
+```
+
+`--internet-networks` may be repeated. The service still keeps virtual
+same-network addresses under the registry: an unregistered address inside the
+virtual subnet is denied instead of being treated as internet egress.
+
 Run a container with one virtual interface:
 
 ```bash
@@ -142,8 +155,9 @@ The prototype is intentionally minimal:
 
 * IPv4 TCP is implemented; IPv6 routing currently returns `EAFNOSUPPORT`.
 * UDP is not implemented.
-* Internet egress is not implemented. A connection such as `curl 8.8.8.8`
-  is denied unless that destination is represented by a registered virtual
+* Internet egress is opt-in per logical network via service-side
+  `--internet-networks`. Without it, a connection such as `curl 8.8.8.8` is
+  denied unless that destination is represented by a registered virtual
   container port and route.
 * There is no virtual DNS proxy yet.
 * Minimal rtnetlink interface discovery for `ip a` is implemented. Broader

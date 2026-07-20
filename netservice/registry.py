@@ -217,15 +217,8 @@ class VirtualNetworkRegistry:
         protocol: str,
     ) -> PortMapping:
         with self._lock:
-            source = self.containers.get(container_id)
-            if source is None:
-                raise RegistryError(f"unknown container: {container_id}", "ENETUNREACH")
-            if not any(interface.network == network_name for interface in source.interfaces):
-                raise RegistryError(f"network does not exist: {network_name}", "ENETUNREACH")
-
-            network = self.networks.get(network_name)
-            if network is None:
-                raise RegistryError(f"network does not exist: {network_name}", "ENETUNREACH")
+            self.ensure_source_network(container_id, network_name)
+            network = self.networks[network_name]
             if destination_ip not in network.interfaces_by_ip:
                 raise RegistryError(
                     f"host is unreachable: {destination_ip}",
@@ -240,6 +233,27 @@ class VirtualNetworkRegistry:
                     "ECONNREFUSED",
                 )
             return mapping
+
+    def ensure_source_network(self, container_id: str, network_name: str) -> None:
+        with self._lock:
+            source = self.containers.get(container_id)
+            if source is None:
+                raise RegistryError(f"unknown container: {container_id}", "ENETUNREACH")
+            if not any(interface.network == network_name for interface in source.interfaces):
+                raise RegistryError(f"network does not exist: {network_name}", "ENETUNREACH")
+            if network_name not in self.networks:
+                raise RegistryError(f"network does not exist: {network_name}", "ENETUNREACH")
+
+    def destination_inside_network(self, network_name: str, destination_ip: str) -> bool:
+        with self._lock:
+            network = self.networks.get(network_name)
+            if network is None:
+                raise RegistryError(f"network does not exist: {network_name}", "ENETUNREACH")
+            try:
+                address = ipaddress.ip_address(destination_ip)
+            except ValueError as exc:
+                raise RegistryError(f"invalid IP address: {destination_ip}", "EINVAL") from exc
+            return address.version == network.subnet.version and address in network.subnet
 
     def interface(
         self, container_id: str, interface_name: str, network_name: str
@@ -278,4 +292,3 @@ def require_string(data: dict[str, object], key: str) -> str:
 
 def optional_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
-
