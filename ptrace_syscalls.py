@@ -3,9 +3,10 @@
 
 Usage examples:
     ./ptrace_syscalls.py -- /bin/ls -la
-    ./ptrace_syscalls.py --rootfs ./ubuntu_c --quiet -- /bin/bash
-    ./ptrace_syscalls.py --rootfs ./ubuntu_c --uid 0 --gid 0 --quiet -- /bin/bash
+    ./ptrace_syscalls.py --rootfs ./ubuntu_c -- /bin/bash
+    ./ptrace_syscalls.py --rootfs ./ubuntu_c --uid 0 --gid 0 -- /bin/bash
     ./ptrace_syscalls.py --rootfs ./ubuntu_c --bind /tmp:/host-tmp -- /bin/ls /host-tmp
+    ./ptrace_syscalls.py --netdev name=eth0,network=backend --netservice /tmp/net.unix -- /bin/bash
 
 This script is intentionally dependency-free. It currently supports Linux
 x86_64, where syscall arguments live in rdi, rsi, rdx, r10, r8, r9.
@@ -45,6 +46,13 @@ from ptrace_common import (
     signal_name,
 )
 from virtual_ids import NO_ID, VirtualIds
+from virtual_network import (
+    ContainerNetworkConfig,
+    NetworkServiceError,
+    VirtualNetworkRuntime,
+    generate_container_id,
+    parse_netdev,
+)
 from virtual_paths import BindMount, VirtualRoot
 
 
@@ -85,9 +93,10 @@ STRING_ARGS = {
 
 SyscallHandler = Callable[[SyscallContext], None]
 SYSCALL_HANDLERS: dict[str, list[tuple[str, SyscallHandler]]] = {}
-TRACE_LOGGING = True
+TRACE_LOGGING = False
 ROOTFS: VirtualRoot | None = None
 VIRTUAL_IDS: VirtualIds | None = None
+VIRTUAL_NETWORK: VirtualNetworkRuntime | None = None
 
 
 def syscall_handler(*syscall_names: str, when: str = "both"):
@@ -187,6 +196,8 @@ def syscall_entry(pid: int) -> SyscallRecord:
         metadata.update(ROOTFS.rewrite_syscall_entry(pid, name, args, regs))
     if VIRTUAL_IDS is not None:
         metadata.update(VIRTUAL_IDS.neutralize_syscall(pid, name, regs))
+    if VIRTUAL_NETWORK is not None:
+        metadata.update(VIRTUAL_NETWORK.rewrite_syscall_entry(pid, name, args, regs))
 
     rendered_args = format_syscall_args(pid, name, args)
     dispatch_syscall_handlers(
@@ -243,6 +254,8 @@ def syscall_exit(pid: int, record: SyscallRecord | None) -> None:
         ROOTFS.handle_syscall_exit(context, record)
     if VIRTUAL_IDS is not None:
         VIRTUAL_IDS.handle_syscall_exit(context, record)
+    if VIRTUAL_NETWORK is not None:
+        VIRTUAL_NETWORK.handle_syscall_exit(context, record)
 
     dispatch_syscall_handlers(context)
 
@@ -277,6 +290,9 @@ def trace(initial_pids: set[int]) -> int:
     if VIRTUAL_IDS is not None:
         for pid in initial_pids:
             VIRTUAL_IDS.register_pid(pid)
+    if VIRTUAL_NETWORK is not None:
+        for pid in initial_pids:
+            VIRTUAL_NETWORK.register_pid(pid)
 
     alive = set(initial_pids)
     configured: set[int] = set()
@@ -307,6 +323,8 @@ def trace(initial_pids: set[int]) -> int:
                     ROOTFS.drop_pid(pid)
                 if VIRTUAL_IDS is not None:
                     VIRTUAL_IDS.drop_pid(pid)
+                if VIRTUAL_NETWORK is not None:
+                    VIRTUAL_NETWORK.drop_pid(pid)
                 if not alive:
                     exit_code = code
                 continue
@@ -322,6 +340,8 @@ def trace(initial_pids: set[int]) -> int:
                     ROOTFS.drop_pid(pid)
                 if VIRTUAL_IDS is not None:
                     VIRTUAL_IDS.drop_pid(pid)
+                if VIRTUAL_NETWORK is not None:
+                    VIRTUAL_NETWORK.drop_pid(pid)
                 if not alive:
                     exit_code = 128 + sig
                 continue
@@ -362,6 +382,8 @@ def trace(initial_pids: set[int]) -> int:
                         ROOTFS.inherit_pid(pid, child_pid)
                     if VIRTUAL_IDS is not None:
                         VIRTUAL_IDS.inherit_pid(pid, child_pid)
+                    if VIRTUAL_NETWORK is not None:
+                        VIRTUAL_NETWORK.inherit_pid(pid, child_pid)
                     event_name = {
                         PTRACE_EVENT_FORK: "fork",
                         PTRACE_EVENT_VFORK: "vfork",
@@ -436,7 +458,15 @@ def parse_args() -> argparse.Namespace:
         "-q",
         "--quiet",
         action="store_true",
-        help="suppress tracer logs and leave only the traced program output",
+        help="deprecated no-op; tracer logs are disabled by default",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        "--log",
+        dest="verbose",
+        action="store_true",
+        help="enable tracer syscall logs",
     )
     parser.add_argument(
         "-b",
@@ -460,6 +490,26 @@ def parse_args() -> argparse.Namespace:
         "--gid",
         type=parse_virtual_id,
         help="virtual gid visible to the traced process; defaults to --uid if set",
+    )
+    parser.add_argument(
+        "--netdev",
+        action="append",
+        default=[],
+        type=parse_netdev,
+        metavar="FIELD=VALUE,...",
+        help=(
+            "virtual network interface description; repeatable. Required fields "
+            "are name and network, optional fields are ip, gateway, mac, mtu, dns"
+        ),
+    )
+    parser.add_argument(
+        "--netservice",
+        metavar="UNIX_SOCKET",
+        help="Unix stream socket path for the external virtual network service",
+    )
+    parser.add_argument(
+        "--container-id",
+        help="stable container id sent to the virtual network service",
     )
     parser.add_argument(
         "command",
@@ -486,6 +536,27 @@ def parse_args() -> argparse.Namespace:
     elif args.uid is None and args.gid is not None:
         args.uid = os.getuid()
 
+    if args.netdev and not args.netservice:
+        parser.error("--netdev requires --netservice")
+
+    if args.netservice is not None:
+        args.netservice = os.path.abspath(args.netservice)
+
+    if args.netdev:
+        seen_interfaces: set[str] = set()
+        for interface in args.netdev:
+            if interface.name in seen_interfaces:
+                parser.error(f"duplicate --netdev interface name: {interface.name}")
+            seen_interfaces.add(interface.name)
+        args.container_id = args.container_id or generate_container_id()
+        args.network_config = ContainerNetworkConfig(
+            container_id=args.container_id,
+            interfaces=args.netdev,
+            service_socket=args.netservice,
+        )
+    else:
+        args.network_config = None
+
     return args
 
 
@@ -498,11 +569,11 @@ def ensure_supported_architecture() -> None:
 
 
 def main() -> int:
-    global ROOTFS, TRACE_LOGGING, VIRTUAL_IDS
+    global ROOTFS, TRACE_LOGGING, VIRTUAL_IDS, VIRTUAL_NETWORK
 
     ensure_supported_architecture()
     args = parse_args()
-    TRACE_LOGGING = not args.quiet
+    TRACE_LOGGING = bool(args.verbose)
     ROOTFS = (
         VirtualRoot(args.rootfs, binds=args.bind)
         if args.rootfs is not None
@@ -513,7 +584,31 @@ def main() -> int:
         if args.uid is not None and args.gid is not None
         else None
     )
-    return trace({launch_tracee(args.command, ROOTFS)})
+    VIRTUAL_NETWORK = (
+        VirtualNetworkRuntime(args.network_config)
+        if args.network_config is not None
+        else None
+    )
+
+    child_pid = launch_tracee(args.command, ROOTFS)
+    try:
+        if VIRTUAL_NETWORK is not None:
+            VIRTUAL_NETWORK.register_container(child_pid)
+        return trace({child_pid})
+    except NetworkServiceError as exc:
+        print(str(exc), file=sys.stderr)
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            os.waitpid(child_pid, 0)
+        except OSError:
+            pass
+        return 125
+    finally:
+        if VIRTUAL_NETWORK is not None:
+            VIRTUAL_NETWORK.unregister_container()
 
 
 if __name__ == "__main__":
