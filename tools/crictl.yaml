@@ -1,0 +1,4 @@
+runtime-endpoint: unix:///tmp/pnfroot.sock
+image-endpoint: unix:///tmp/pnfroot.sock
+timeout: 1
+debug: false

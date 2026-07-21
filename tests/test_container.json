@@ -1,0 +1,23 @@
+{
+  "metadata": {
+    "name": "busybox-container",
+    "attempt": 1
+  },
+  "image": {
+    "image": "busybox"
+  },
+  "command": [
+    "/bin/sh"
+  ],
+  "args": [
+    "-c",
+    "echo hello from my cri && sleep 3600"
+  ],
+  "log_path": "busybox.log",
+  "linux": {
+    "resources": {
+      "cpu_limit": 0,
+      "memory_limit_in_bytes": 0
+    }
+  }
+}

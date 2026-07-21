@@ -1,0 +1,10 @@
+{
+  "metadata": {
+    "name": "test-pod",
+    "uid": "test-uid",
+    "namespace": "default",
+    "attempt": 1
+  },
+  "log_directory": "/tmp/mycri/logs",
+  "linux": {}
+}
