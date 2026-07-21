@@ -6,6 +6,8 @@ import errno
 import os
 import posixpath
 import stat as stat_module
+import struct
+import sys
 import tempfile
 from dataclasses import dataclass
 
@@ -17,6 +19,7 @@ from ptrace_common import (
     UserRegsStruct,
     WORD_SIZE,
     read_c_string_bytes,
+    read_pointer,
     set_regs,
     set_syscall_result,
     signed64,
@@ -220,6 +223,37 @@ def split_virtual_path(path: str) -> list[str]:
     return [part for part in path.split("/") if part and part != "."]
 
 
+def read_elf_interpreter(path: str) -> str | None:
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(64)
+            if len(header) < 64 or not header.startswith(b"\x7fELF"):
+                return None
+            if header[4] != 2:
+                return None
+            endian = "<" if header[5] == 1 else ">"
+            e_phoff = struct.unpack_from(endian + "Q", header, 32)[0]
+            e_phentsize = struct.unpack_from(endian + "H", header, 54)[0]
+            e_phnum = struct.unpack_from(endian + "H", header, 56)[0]
+            handle.seek(e_phoff)
+            for _ in range(e_phnum):
+                entry = handle.read(e_phentsize)
+                if len(entry) < e_phentsize:
+                    return None
+                if struct.unpack_from(endian + "I", entry, 0)[0] != 3:
+                    continue
+                p_offset = struct.unpack_from(endian + "Q", entry, 8)[0]
+                p_filesz = struct.unpack_from(endian + "Q", entry, 32)[0]
+                current = handle.tell()
+                handle.seek(p_offset)
+                data = handle.read(p_filesz).split(b"\x00", 1)[0]
+                handle.seek(current)
+                return os.fsdecode(data)
+    except OSError:
+        return None
+    return None
+
+
 def escape_mount_field(value: str) -> str:
     return (
         value.replace("\\", "\\134")
@@ -248,6 +282,12 @@ class TraceeScratch:
 
     def write_c_string(self, value: bytes) -> int:
         data = value + b"\x00"
+        self.cursor = (self.cursor - len(data)) & ~(WORD_SIZE - 1)
+        write_tracee_bytes(self.pid, self.cursor, data)
+        return self.cursor
+
+    def write_pointer_array(self, values: list[int]) -> int:
+        data = b"".join(value.to_bytes(WORD_SIZE, sys.byteorder) for value in values)
         self.cursor = (self.cursor - len(data)) & ~(WORD_SIZE - 1)
         write_tracee_bytes(self.pid, self.cursor, data)
         return self.cursor
@@ -298,6 +338,13 @@ class VirtualRoot:
         if virtual_path == "/":
             return self.root
         return os.path.join(self.root, *split_virtual_path(virtual_path))
+
+    def should_use_direct_loader(self, host_path: str) -> bool:
+        busybox_path = self.raw_host_path("/bin/busybox")
+        try:
+            return os.path.exists(busybox_path) and os.path.samefile(host_path, busybox_path)
+        except OSError:
+            return False
 
     def rootfs_host_path_to_virtual(self, host_path: str) -> str | None:
         root = os.path.realpath(self.root)
@@ -809,6 +856,60 @@ class VirtualRoot:
             return None
         return os.fsdecode(data)
 
+    def read_string_array_bytes(self, pid: int, address: int, max_items: int = 4096) -> list[bytes] | None:
+        if address == 0:
+            return []
+        values: list[bytes] = []
+        try:
+            for index in range(max_items):
+                item_address = read_pointer(pid, address + index * WORD_SIZE)
+                if item_address == 0:
+                    return values
+                value = read_c_string_bytes(pid, item_address)
+                if value is None:
+                    return None
+                values.append(value)
+        except OSError:
+            return None
+        return values
+
+    def prepare_dynamic_exec(
+        self,
+        pid: int,
+        name: str,
+        args: list[int],
+        virtual_path: str,
+        host_path: str,
+        scratch: TraceeScratch,
+        regs: UserRegsStruct,
+    ) -> tuple[str, str]:
+        interpreter = read_elf_interpreter(host_path)
+        if not interpreter or not self.should_use_direct_loader(host_path):
+            return host_path, host_path
+
+        host_interpreter = self.raw_host_path(interpreter)
+        if not os.path.exists(host_interpreter):
+            return host_path, host_path
+
+        argv_index = 1 if name == "execve" else 2
+        argv_values = self.read_string_array_bytes(pid, args[argv_index])
+        if argv_values is None:
+            return host_path, host_path
+
+        executable_host_path = self.raw_host_path(virtual_path)
+        argv0 = argv_values[0] if argv_values else os.fsencode(virtual_path)
+        new_argv = [
+            os.fsencode(host_interpreter),
+            b"--argv0",
+            argv0,
+            os.fsencode(executable_host_path),
+            *argv_values[1:],
+        ]
+        pointer_values = [scratch.write_c_string(value) for value in new_argv]
+        argv_address = scratch.write_pointer_array([*pointer_values, 0])
+        setattr(regs, ARG_REGISTERS[argv_index], argv_address)
+        return host_interpreter, executable_host_path
+
     def rewrite_syscall_entry(
         self, pid: int, name: str, args: list[int], regs: UserRegsStruct
     ) -> dict[str, object]:
@@ -852,6 +953,17 @@ class VirtualRoot:
                         virtual_path,
                         follow_final_symlink=spec.follows_final_symlink(args),
                     )
+            exec_host_path = host_path
+            if name in {"execve", "execveat"} and spec.path_index in {0, 1}:
+                host_path, exec_host_path = self.prepare_dynamic_exec(
+                    pid,
+                    name,
+                    args,
+                    virtual_path,
+                    host_path,
+                    scratch,
+                    regs,
+                )
             if self.path_needs_writable_parent(name, args, spec):
                 self.prepare_write_parent(virtual_path, host_path, metadata)
             host_address = scratch.write_c_string(os.fsencode(host_path))
@@ -877,7 +989,7 @@ class VirtualRoot:
 
             if name in {"execve", "execveat"} and spec.path_index in {0, 1}:
                 metadata["exec_virtual_path"] = virtual_path
-                metadata["exec_host_path"] = host_path
+                metadata["exec_host_path"] = exec_host_path
 
         if changed:
             set_regs(pid, regs)

@@ -11,7 +11,7 @@
   ],
   "args": [
     "-c",
-    "echo hello from my cri && sleep 3600"
+    "echo hello from my cri && ls && sleep 3600"
   ],
   "log_path": "busybox.log",
   "linux": {

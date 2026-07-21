@@ -5,6 +5,7 @@
 - RunPodSandbox
 - CreateContainer
 - StartContainer
+- Exec
 - ListContainers
 - ContainerStatus
 
@@ -13,8 +14,37 @@
 ```bash
 cd /home/birdiecode/Documents/tk8s/pnfroot
 . .venv/bin/activate
-python pnfroot.py --socket-path /tmp/pnfroot.sock --image-store-dir /tmp/pnfroot/images
+python pnfroot.py \
+  --socket-path /tmp/pnfroot.sock \
+  --image-store-dir /tmp/pnfroot/images \
+  --container-store-dir /tmp/pnfroot/containers
 ```
+
+По умолчанию streaming-сервер для Exec слушает `127.0.0.1` на случайном порту и возвращает CRI URL вида
+`http://127.0.0.1:<port>/exec/<token>`. Порт можно зафиксировать через `--stream-port`, а hostname в URL
+переопределить через `--stream-public-host`.
+
+Контейнерные процессы запускаются через библиотечный API `ptrace_syscalls.py`: `pnfroot.py` форкает внутренний
+trace-supervisor и вызывает ptrace-контейнеризацию напрямую, без запуска `ptrace_syscalls.py` как CLI-обертки.
+
+## Хранилища
+
+`--image-store-dir` хранит только content-store образов:
+
+```text
+images/<image-ref>/
+  pnfroot-image.json
+  blobs/sha256/<digest>
+```
+
+Распакованные rootfs контейнеров лежат отдельно:
+
+```text
+containers/<container-id>/rootfs/
+```
+
+`PullImage` кладет в image-store blobs/manifest/config. `CreateContainer` при необходимости подтягивает образ и
+распаковывает его слои в отдельный rootfs конкретного контейнера.
 
 ## Пример работы
 
@@ -57,4 +87,12 @@ container = runtime.CreateContainer(api_pb2.CreateContainerRequest(
 runtime.StartContainer(api_pb2.StartContainerRequest(container_id=container.container_id))
 print(container.container_id)
 PY
+```
+
+3. Выполнить streaming Exec:
+
+```bash
+tools/crictl --runtime-endpoint unix:///tmp/pnfroot.sock \
+  --image-endpoint unix:///tmp/pnfroot.sock \
+  exec -it <container-id> /bin/sh
 ```

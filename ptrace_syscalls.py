@@ -15,10 +15,14 @@ x86_64, where syscall arguments live in rdi, rsi, rdx, r10, r8, r9.
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import os
 import platform
 import signal
+import struct
 import sys
+import termios
 from collections.abc import Callable
 
 from ptrace_common import (
@@ -31,6 +35,7 @@ from ptrace_common import (
     PTRACE_SYSCALL,
     PTRACE_TRACEME,
     SYSCALL_NAMES,
+    SYSCALL_NUMBERS,
     SYSCALL_STOP,
     WAIT_ALL_TRACED,
     WORD_SIZE,
@@ -42,6 +47,8 @@ from ptrace_common import (
     ptrace,
     read_c_string,
     read_string_array,
+    set_regs,
+    set_syscall_result,
     set_trace_options,
     signal_name,
 )
@@ -54,7 +61,7 @@ from virtual_network import (
     parse_netdev,
     parse_publish,
 )
-from virtual_paths import BindMount, VirtualRoot
+from virtual_paths import BindMount, VirtualRoot, normalize_virtual_path
 
 
 STRING_ARGS = {
@@ -98,6 +105,7 @@ TRACE_LOGGING = False
 ROOTFS: VirtualRoot | None = None
 VIRTUAL_IDS: VirtualIds | None = None
 VIRTUAL_NETWORK: VirtualNetworkRuntime | None = None
+NOOP_SYSCALL_NUMBER = SYSCALL_NUMBERS.get("getpid", 39)
 
 
 def syscall_handler(*syscall_names: str, when: str = "both"):
@@ -193,6 +201,10 @@ def syscall_entry(pid: int) -> SyscallRecord:
         int(regs.r9),
     ]
     metadata: dict[str, object] = {}
+    if name == "rseq":
+        regs.orig_rax = NOOP_SYSCALL_NUMBER
+        set_regs(pid, regs)
+        metadata["forced_result"] = -errno.ENOSYS
     if ROOTFS is not None:
         metadata.update(ROOTFS.rewrite_syscall_entry(pid, name, args, regs))
     if VIRTUAL_IDS is not None:
@@ -257,6 +269,8 @@ def syscall_exit(pid: int, record: SyscallRecord | None) -> None:
         VIRTUAL_IDS.handle_syscall_exit(context, record)
     if VIRTUAL_NETWORK is not None:
         VIRTUAL_NETWORK.handle_syscall_exit(context, record)
+    if record is not None and "forced_result" in record.metadata:
+        set_syscall_result(context, int(record.metadata["forced_result"]))
 
     dispatch_syscall_handlers(context)
 
@@ -265,18 +279,119 @@ def resume_syscall(pid: int, sig: int = 0) -> None:
     ptrace(PTRACE_SYSCALL, pid, 0, sig)
 
 
-def launch_tracee(command: list[str], rootfs: VirtualRoot | None = None) -> int:
+def read_elf_interpreter(path: str) -> str | None:
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(64)
+            if len(header) < 64 or not header.startswith(b"\x7fELF"):
+                return None
+            elf_class = header[4]
+            endian_flag = header[5]
+            if elf_class != 2:
+                return None
+            endian = "<" if endian_flag == 1 else ">"
+            e_phoff = struct.unpack_from(endian + "Q", header, 32)[0]
+            e_phentsize = struct.unpack_from(endian + "H", header, 54)[0]
+            e_phnum = struct.unpack_from(endian + "H", header, 56)[0]
+            handle.seek(e_phoff)
+            for _ in range(e_phnum):
+                entry = handle.read(e_phentsize)
+                if len(entry) < e_phentsize:
+                    return None
+                p_type = struct.unpack_from(endian + "I", entry, 0)[0]
+                if p_type != 3:  # PT_INTERP
+                    continue
+                p_offset = struct.unpack_from(endian + "Q", entry, 8)[0]
+                p_filesz = struct.unpack_from(endian + "Q", entry, 32)[0]
+                current = handle.tell()
+                handle.seek(p_offset)
+                data = handle.read(p_filesz).split(b"\x00", 1)[0]
+                handle.seek(current)
+                return os.fsdecode(data)
+    except OSError:
+        return None
+    return None
+
+
+def read_script_interpreter(path: str) -> list[str] | None:
+    try:
+        with open(path, "rb") as handle:
+            line = handle.readline(256)
+    except OSError:
+        return None
+    if not line.startswith(b"#!"):
+        return None
+    text = os.fsdecode(line[2:].strip())
+    return text.split() or None
+
+
+def rootfs_exec_command(command: list[str], rootfs: VirtualRoot) -> list[str]:
+    if not command or not command[0].startswith("/"):
+        return command
+
+    virtual_executable = normalize_virtual_path(command[0])
+    host_executable = rootfs.raw_host_path(virtual_executable)
+
+    script_interpreter = read_script_interpreter(host_executable)
+    if script_interpreter:
+        interpreter = script_interpreter[0]
+        if interpreter.startswith("/"):
+            rewritten = rootfs_exec_command([interpreter, *script_interpreter[1:], virtual_executable, *command[1:]], rootfs)
+            return rewritten if rewritten[0] != interpreter else command
+        return command
+
+    elf_interpreter = read_elf_interpreter(host_executable)
+    if elf_interpreter and rootfs.should_use_direct_loader(host_executable):
+        host_interpreter = rootfs.raw_host_path(elf_interpreter)
+        if os.path.exists(host_interpreter):
+            return [host_interpreter, "--argv0", command[0], host_executable, *command[1:]]
+
+    return command
+
+
+def launch_tracee(
+    command: list[str],
+    rootfs: VirtualRoot | None = None,
+    cwd: str = "/",
+    env: dict[str, str] | None = None,
+    stdin_fd: int | None = None,
+    stdout_fd: int | None = None,
+    stderr_fd: int | None = None,
+    controlling_tty: bool = False,
+) -> int:
     child_pid = os.fork()
     if child_pid == 0:
         try:
-            env = os.environ.copy()
+            exec_command = command
+            child_env = os.environ.copy() if env is None else dict(env)
             if rootfs is not None:
-                os.chdir(rootfs.root)
-                env["PWD"] = "/"
+                os.chdir(rootfs.raw_host_path(cwd))
+                child_env["PWD"] = cwd
+                exec_command = rootfs_exec_command(command, rootfs)
+
+            if controlling_tty:
+                os.setsid()
+                tty_fd = stdin_fd if stdin_fd is not None else stdout_fd
+                if tty_fd is not None:
+                    fcntl.ioctl(tty_fd, termios.TIOCSCTTY, 0)
+
+            for target_fd, source_fd in (
+                (0, stdin_fd),
+                (1, stdout_fd),
+                (2, stderr_fd),
+            ):
+                if source_fd is not None:
+                    os.dup2(source_fd, target_fd)
+
+            try:
+                open_max = os.sysconf("SC_OPEN_MAX")
+            except (OSError, ValueError):
+                open_max = 1024
+            os.closerange(3, min(int(open_max), 65536))
 
             ptrace(PTRACE_TRACEME, 0, 0, 0)
             os.kill(os.getpid(), signal.SIGSTOP)
-            os.execvpe(command[0], command, env)
+            os.execvpe(exec_command[0], exec_command, child_env)
         except OSError as exc:
             os.write(2, f"exec failed: {exc}\n".encode("utf-8"))
             os._exit(127)
@@ -284,10 +399,83 @@ def launch_tracee(command: list[str], rootfs: VirtualRoot | None = None) -> int:
     return child_pid
 
 
-def trace(initial_pids: set[int]) -> int:
+def run_tracee(
+    command: list[str],
+    *,
+    rootfs_path: str | None = None,
+    binds: list[BindMount] | None = None,
+    cwd: str = "/",
+    env: dict[str, str] | None = None,
+    stdin_fd: int | None = None,
+    stdout_fd: int | None = None,
+    stderr_fd: int | None = None,
+    controlling_tty: bool = False,
+    uid: int | None = None,
+    gid: int | None = None,
+    network_config: ContainerNetworkConfig | None = None,
+    trace_logging: bool = False,
+) -> int:
+    global ROOTFS, TRACE_LOGGING, VIRTUAL_IDS, VIRTUAL_NETWORK
+
+    ensure_supported_architecture()
+    cwd = normalize_virtual_path(cwd)
+    TRACE_LOGGING = trace_logging
+    ROOTFS = (
+        VirtualRoot(rootfs_path, binds=binds or [])
+        if rootfs_path is not None
+        else None
+    )
+    VIRTUAL_IDS = (
+        VirtualIds(uid, gid)
+        if uid is not None and gid is not None
+        else None
+    )
+    VIRTUAL_NETWORK = (
+        VirtualNetworkRuntime(network_config)
+        if network_config is not None
+        else None
+    )
+
+    child_pid = launch_tracee(
+        command,
+        ROOTFS,
+        cwd,
+        env=env,
+        stdin_fd=stdin_fd,
+        stdout_fd=stdout_fd,
+        stderr_fd=stderr_fd,
+        controlling_tty=controlling_tty,
+    )
+    for fd in {stdin_fd, stdout_fd, stderr_fd} - {None}:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    try:
+        if VIRTUAL_NETWORK is not None:
+            VIRTUAL_NETWORK.register_container(child_pid)
+        return trace({child_pid}, initial_cwd=cwd)
+    except NetworkServiceError as exc:
+        print(str(exc), file=sys.stderr)
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            os.waitpid(child_pid, 0)
+        except OSError:
+            pass
+        return 125
+    finally:
+        if VIRTUAL_NETWORK is not None:
+            VIRTUAL_NETWORK.unregister_container()
+
+
+def trace(initial_pids: set[int], initial_cwd: str = "/") -> int:
     if ROOTFS is not None:
         for pid in initial_pids:
-            ROOTFS.register_pid(pid)
+            ROOTFS.register_pid(pid, initial_cwd)
     if VIRTUAL_IDS is not None:
         for pid in initial_pids:
             VIRTUAL_IDS.register_pid(pid)
@@ -483,6 +671,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cwd",
+        default="/",
+        help="initial working directory visible inside the virtual rootfs",
+    )
+    parser.add_argument(
         "--uid",
         type=parse_virtual_id,
         help="virtual uid visible to the traced process",
@@ -544,6 +737,10 @@ def parse_args() -> argparse.Namespace:
     elif args.bind:
         parser.error("--bind requires --rootfs")
 
+    args.cwd = normalize_virtual_path(args.cwd)
+    if args.rootfs is None and args.cwd != "/":
+        parser.error("--cwd requires --rootfs")
+
     if args.uid is not None and args.gid is None:
         args.gid = args.uid
     elif args.uid is None and args.gid is not None:
@@ -585,46 +782,17 @@ def ensure_supported_architecture() -> None:
 
 
 def main() -> int:
-    global ROOTFS, TRACE_LOGGING, VIRTUAL_IDS, VIRTUAL_NETWORK
-
-    ensure_supported_architecture()
     args = parse_args()
-    TRACE_LOGGING = bool(args.verbose)
-    ROOTFS = (
-        VirtualRoot(args.rootfs, binds=args.bind)
-        if args.rootfs is not None
-        else None
+    return run_tracee(
+        args.command,
+        rootfs_path=args.rootfs,
+        binds=args.bind,
+        cwd=args.cwd,
+        uid=args.uid,
+        gid=args.gid,
+        network_config=args.network_config,
+        trace_logging=bool(args.verbose),
     )
-    VIRTUAL_IDS = (
-        VirtualIds(args.uid, args.gid)
-        if args.uid is not None and args.gid is not None
-        else None
-    )
-    VIRTUAL_NETWORK = (
-        VirtualNetworkRuntime(args.network_config)
-        if args.network_config is not None
-        else None
-    )
-
-    child_pid = launch_tracee(args.command, ROOTFS)
-    try:
-        if VIRTUAL_NETWORK is not None:
-            VIRTUAL_NETWORK.register_container(child_pid)
-        return trace({child_pid})
-    except NetworkServiceError as exc:
-        print(str(exc), file=sys.stderr)
-        try:
-            os.kill(child_pid, signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child_pid, 0)
-        except OSError:
-            pass
-        return 125
-    finally:
-        if VIRTUAL_NETWORK is not None:
-            VIRTUAL_NETWORK.unregister_container()
 
 
 if __name__ == "__main__":
