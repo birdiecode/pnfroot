@@ -20,7 +20,6 @@ import fcntl
 import os
 import platform
 import signal
-import struct
 import sys
 import termios
 from collections.abc import Callable
@@ -61,7 +60,7 @@ from virtual_network import (
     parse_netdev,
     parse_publish,
 )
-from virtual_paths import BindMount, VirtualRoot, normalize_virtual_path
+from virtual_paths import BindMount, VirtualRoot, normalize_virtual_path, read_elf_interpreter
 
 
 STRING_ARGS = {
@@ -277,40 +276,6 @@ def syscall_exit(pid: int, record: SyscallRecord | None) -> None:
 
 def resume_syscall(pid: int, sig: int = 0) -> None:
     ptrace(PTRACE_SYSCALL, pid, 0, sig)
-
-
-def read_elf_interpreter(path: str) -> str | None:
-    try:
-        with open(path, "rb") as handle:
-            header = handle.read(64)
-            if len(header) < 64 or not header.startswith(b"\x7fELF"):
-                return None
-            elf_class = header[4]
-            endian_flag = header[5]
-            if elf_class != 2:
-                return None
-            endian = "<" if endian_flag == 1 else ">"
-            e_phoff = struct.unpack_from(endian + "Q", header, 32)[0]
-            e_phentsize = struct.unpack_from(endian + "H", header, 54)[0]
-            e_phnum = struct.unpack_from(endian + "H", header, 56)[0]
-            handle.seek(e_phoff)
-            for _ in range(e_phnum):
-                entry = handle.read(e_phentsize)
-                if len(entry) < e_phentsize:
-                    return None
-                p_type = struct.unpack_from(endian + "I", entry, 0)[0]
-                if p_type != 3:  # PT_INTERP
-                    continue
-                p_offset = struct.unpack_from(endian + "Q", entry, 8)[0]
-                p_filesz = struct.unpack_from(endian + "Q", entry, 32)[0]
-                current = handle.tell()
-                handle.seek(p_offset)
-                data = handle.read(p_filesz).split(b"\x00", 1)[0]
-                handle.seek(current)
-                return os.fsdecode(data)
-    except OSError:
-        return None
-    return None
 
 
 def read_script_interpreter(path: str) -> list[str] | None:

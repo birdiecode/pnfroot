@@ -1,0 +1,13 @@
+# Local rootfs/example fixtures
+ubuntu_c/*
+ubuntu_n/*
+example/*
+
+# Python/local caches
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

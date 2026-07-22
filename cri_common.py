@@ -12,14 +12,20 @@ def configure_logging(verbose=False):
     )
 
 
-def log_rpc(method):
-    @wraps(method)
-    async def wrapper(self, request, context):
-        request_text = str(request).strip() or "<empty request>"
-        logger.info("%s.%s request:\n%s", self.__class__.__name__, method.__name__, request_text)
-        return await method(self, request, context)
+def log_rpc(method=None, *, request_log=True):
+    def decorator(method):
+        @wraps(method)
+        async def wrapper(self, request, context):
+            if request_log:
+                request_text = str(request).strip() or "<empty request>"
+                logger.info("%s.%s request:\n%s", self.__class__.__name__, method.__name__, request_text)
+            return await method(self, request, context)
 
-    return wrapper
+        return wrapper
+
+    if method is None:
+        return decorator
+    return decorator(method)
 
 
 def labels_match(labels, selector):

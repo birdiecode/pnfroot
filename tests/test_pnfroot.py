@@ -6,6 +6,7 @@ import os
 import socket
 import struct
 import subprocess
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -21,15 +22,20 @@ SPEC.loader.exec_module(pnfroot)
 
 
 class PnfrootTests(unittest.TestCase):
-    def test_pull_image_from_existing_rootfs_directory(self) -> None:
+    def test_pull_image_to_store_rejects_local_rootfs_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            output_dir = Path(tmpdir) / "image"
-            pulled_path = pnfroot.pull_image_to_dir("ubuntu_c", output=str(output_dir))
+            source_rootfs = Path(tmpdir) / "source-rootfs"
+            create_minimal_rootfs(source_rootfs)
 
-            self.assertTrue(Path(pulled_path).exists())
-            self.assertTrue((Path(pulled_path) / "etc").exists())
+            with self.assertRaisesRegex(ValueError, "local rootfs image sources are not supported"):
+                pnfroot.pull_image_to_store(str(source_rootfs), Path(tmpdir) / "images")
 
-    def test_image_service_loads_existing_rootfs_directory_without_metadata(self) -> None:
+    def test_pull_image_to_store_rejects_file_scheme(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "local rootfs image sources are not supported"):
+                pnfroot.pull_image_to_store("file:///tmp/rootfs", Path(tmpdir) / "images")
+
+    def test_image_service_ignores_existing_rootfs_directory_without_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             image_dir = Path(tmpdir) / "busybox_latest"
             create_minimal_rootfs(image_dir)
@@ -37,33 +43,27 @@ class PnfrootTests(unittest.TestCase):
             service = pnfroot.ImageService(image_store_dir=tmpdir)
             response = asyncio.run(service.ListImages(pnfroot.api_pb2.ListImagesRequest(), FakeContext()))
 
-            repo_tags = [tag for image in response.images for tag in image.repo_tags]
-            self.assertIn("busybox:latest", repo_tags)
-            self.assertTrue((image_dir / pnfroot.IMAGE_METADATA_FILE).exists())
-            self.assertTrue((image_dir / "blobs" / "sha256").exists())
-            self.assertFalse((image_dir / "etc").exists())
+            self.assertEqual(list(response.images), [])
+            self.assertFalse((image_dir / pnfroot.IMAGE_METADATA_FILE).exists())
+            self.assertTrue((image_dir / "etc").exists())
 
-    def test_pull_image_writes_blobs_not_unpacked_rootfs(self) -> None:
+    def test_image_service_pull_rejects_local_rootfs_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source_rootfs = Path(tmpdir) / "source-rootfs"
             image_store = Path(tmpdir) / "images"
             create_minimal_rootfs(source_rootfs)
             service = pnfroot.ImageService(image_store_dir=image_store)
 
-            image_ref = asyncio.run(
-                service.PullImage(
-                    pnfroot.api_pb2.PullImageRequest(image=pnfroot.api_pb2.ImageSpec(image=str(source_rootfs))),
-                    FakeContext(),
+            with self.assertRaises(ExpectedAbort) as raised:
+                asyncio.run(
+                    service.PullImage(
+                        pnfroot.api_pb2.PullImageRequest(image=pnfroot.api_pb2.ImageSpec(image=str(source_rootfs))),
+                        CapturingContext(),
+                    )
                 )
-            ).image_ref
 
-            image_dir = image_store / pnfroot.image_dir_name(image_ref)
-            self.assertTrue((image_dir / "blobs" / "sha256").exists())
-            self.assertFalse((image_dir / "etc").exists())
-
-    def test_unknown_image_does_not_fallback_to_ubuntu_rootfs(self) -> None:
-        with self.assertRaises(FileNotFoundError):
-            pnfroot.resolve_local_image_source("definitely-missing-pnfroot-image")
+            self.assertEqual(raised.exception.code, pnfroot.grpc.StatusCode.INVALID_ARGUMENT)
+            self.assertIn("local rootfs image sources are not supported", raised.exception.message)
 
     def test_runtime_refreshes_legacy_registry_cache(self) -> None:
         image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
@@ -123,7 +123,7 @@ class PnfrootTests(unittest.TestCase):
             (source_rootfs / "usr" / "bin").mkdir(parents=True)
             (source_rootfs / "usr" / "bin" / "awk").write_text("#!/bin/sh\n", encoding="utf-8")
             os.symlink("/usr/bin/awk", source_rootfs / "etc" / "absolute-awk")
-            img = pnfroot.pull_image_to_store(str(source_rootfs), image_store)
+            img = create_content_store_image(source_rootfs, image_store)
 
             runtime = pnfroot.RuntimeService(image_store_dir=image_store, container_store_dir=container_store)
             container = {
@@ -250,7 +250,7 @@ class PnfrootTests(unittest.TestCase):
                 runtime.ExecSync(
                     pnfroot.api_pb2.ExecSyncRequest(
                         container_id="container-rootfs",
-                        cmd=["/bin/sh", "-c", "cat /.rock/metadata.yaml"],
+                        cmd=["/bin/sh", "-c", "printf rootfs-ok"],
                         timeout=5,
                     ),
                     FakeContext(),
@@ -261,9 +261,9 @@ class PnfrootTests(unittest.TestCase):
             runtime.shutdown_stream_server()
 
         self.assertEqual(response.exit_code, 0, response.stderr)
-        self.assertIn(b"name: ubuntu", response.stdout)
+        self.assertEqual(response.stdout, b"rootfs-ok")
 
-    def test_create_container_unpacks_rootfs_outside_image_store_without_pull(self) -> None:
+    def test_create_container_unpacks_cached_registry_image_outside_image_store(self) -> None:
         image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
         container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")
         source_dir = tempfile.TemporaryDirectory(prefix="pnfroot-test-source-")
@@ -272,6 +272,8 @@ class PnfrootTests(unittest.TestCase):
         self.addCleanup(source_dir.cleanup)
         source_rootfs = Path(source_dir.name) / "rootfs"
         create_minimal_rootfs(source_rootfs)
+        image_ref = "busybox:latest"
+        create_content_store_image(source_rootfs, Path(image_store.name), image_ref=image_ref)
         runtime = pnfroot.RuntimeService(image_store_dir=image_store.name, container_store_dir=container_store.name)
 
         pod_response = asyncio.run(
@@ -290,7 +292,7 @@ class PnfrootTests(unittest.TestCase):
                     pod_sandbox_id=pod_response.pod_sandbox_id,
                     config=pnfroot.api_pb2.ContainerConfig(
                         metadata=pnfroot.api_pb2.ContainerMetadata(name="busybox", attempt=1),
-                        image=pnfroot.api_pb2.ImageSpec(image=str(source_rootfs)),
+                        image=pnfroot.api_pb2.ImageSpec(image=image_ref),
                         command=["/bin/sh"],
                     ),
                     sandbox_config=pnfroot.api_pb2.PodSandboxConfig(),
@@ -362,6 +364,47 @@ class PnfrootTests(unittest.TestCase):
         self.assertTrue(response.container_id)
         self.assertLess(elapsed, 1)
         self.assertTrue(started.wait(timeout=1))
+
+    def test_create_container_decodes_byte_envs_before_persisting_state(self) -> None:
+        image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
+        container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")
+        self.addCleanup(image_store.cleanup)
+        self.addCleanup(container_store.cleanup)
+        runtime = pnfroot.RuntimeService(image_store_dir=image_store.name, container_store_dir=container_store.name)
+
+        pod_response = asyncio.run(
+            runtime.RunPodSandbox(
+                pnfroot.api_pb2.RunPodSandboxRequest(
+                    config=pnfroot.api_pb2.PodSandboxConfig(
+                        metadata=pnfroot.api_pb2.PodSandboxMetadata(name="pod", uid="uid", namespace="default", attempt=1),
+                    )
+                ),
+                FakeContext(),
+            )
+        )
+        container_response = asyncio.run(
+            runtime.CreateContainer(
+                pnfroot.api_pb2.CreateContainerRequest(
+                    pod_sandbox_id=pod_response.pod_sandbox_id,
+                    config=pnfroot.api_pb2.ContainerConfig(
+                        metadata=pnfroot.api_pb2.ContainerMetadata(name="container", attempt=1),
+                        image=pnfroot.api_pb2.ImageSpec(image=""),
+                        envs=[
+                            pnfroot.api_pb2.KeyValue(key="KUBERNETES_PORT", value=b"tcp://10.0.0.1:443"),
+                        ],
+                    ),
+                    sandbox_config=pnfroot.api_pb2.PodSandboxConfig(),
+                ),
+                FakeContext(),
+            )
+        )
+
+        container = runtime.find_container(container_response.container_id)
+        self.assertEqual(container["envs"]["KUBERNETES_PORT"], "tcp://10.0.0.1:443")
+
+        with open(runtime.runtime_state_path(), "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        self.assertEqual(state["containers"][0]["envs"]["KUBERNETES_PORT"], "tcp://10.0.0.1:443")
 
     def test_runtime_persists_pods_and_containers_across_restart(self) -> None:
         image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
@@ -505,13 +548,8 @@ class PnfrootTests(unittest.TestCase):
         self.addCleanup(image_store.cleanup)
         self.addCleanup(container_store.cleanup)
         runtime = pnfroot.RuntimeService(image_store_dir=image_store.name, container_store_dir=container_store.name)
-        image_ref = "ubuntu_c:latest"
-        bundle_path = Path(container_store.name) / container_id
-        rootfs_path = bundle_path / "rootfs"
-        pnfroot.pull_image_to_dir(
-            "ubuntu_c",
-            output=str(rootfs_path),
-        )
+        image_ref = "host-rootfs:latest"
+        rootfs_path = Path("/")
         runtime.containers[container_id] = {
             "id": container_id,
             "pod_sandbox_id": "pod",
@@ -532,7 +570,7 @@ class PnfrootTests(unittest.TestCase):
             "annotations": {},
             "image_id": image_ref,
             "process": None,
-            "bundle_path": str(bundle_path),
+            "bundle_path": str(Path(container_store.name) / container_id),
             "rootfs_path": str(rootfs_path),
             "rootfs_status": "ready",
         }
@@ -547,12 +585,102 @@ class FakeContext:
         raise AssertionError(f"unexpected abort {code}: {message}")
 
 
+class ExpectedAbort(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class CapturingContext:
+    async def abort(self, code, message):
+        raise ExpectedAbort(code, message)
+
+
 def create_minimal_rootfs(rootfs: Path) -> None:
     (rootfs / "etc").mkdir(parents=True, exist_ok=True)
     (rootfs / "bin").mkdir(parents=True, exist_ok=True)
     (rootfs / "etc" / "fixture-release").write_text("pnfroot-test\n", encoding="utf-8")
     (rootfs / "bin" / "fixture").write_text("#!/bin/sh\n", encoding="utf-8")
     os.chmod(rootfs / "bin" / "fixture", 0o755)
+
+
+def create_content_store_image(
+    rootfs: Path,
+    image_store: Path,
+    *,
+    image_ref: str = "busybox:latest",
+) -> dict[str, object]:
+    image_store.mkdir(parents=True, exist_ok=True)
+    image_path = image_store / pnfroot.image_dir_name(image_ref)
+    image_path.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(prefix="layer-", suffix=".tar", dir=image_store, delete=False) as handle:
+        layer_path = Path(handle.name)
+    try:
+        with tarfile.open(layer_path, "w", format=tarfile.PAX_FORMAT) as archive:
+            for item in sorted(rootfs.iterdir(), key=lambda path: path.name):
+                archive.add(item, arcname=item.name, recursive=True)
+        layer_payload = layer_path.read_bytes()
+    finally:
+        layer_path.unlink(missing_ok=True)
+
+    layer_digest, layer_size = pnfroot.write_blob_payload(
+        image_path,
+        pnfroot.sha256_bytes(layer_payload),
+        layer_payload,
+    )
+    config_payload = json.dumps(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
+            "created": pnfroot.cri_time_ns(),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    config_digest, config_size = pnfroot.write_blob_bytes(image_path, config_payload)
+    manifest_payload = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_size,
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": layer_digest,
+                    "size": layer_size,
+                }
+            ],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    manifest_digest, manifest_size = pnfroot.write_blob_bytes(image_path, manifest_payload)
+
+    img = pnfroot.image_metadata(image_ref, image_path)
+    img.update(
+        {
+            "image_id": manifest_digest,
+            "manifest_digest": manifest_digest,
+            "manifest_size": manifest_size,
+            "config_digest": config_digest,
+            "layer_digests": [layer_digest],
+            "size": layer_size + config_size + manifest_size,
+            "source_type": "registry",
+            "source_image": image_ref,
+            "registry": "registry.example.invalid",
+            "repository": "library/fixture",
+            "platform": pnfroot.IMAGE_PLATFORM,
+        }
+    )
+    pnfroot.write_image_metadata(img)
+    return img
 
 
 class SpdyTestClient:

@@ -2,146 +2,102 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import asyncio
 import base64
-import binascii
 import fcntl
-import hashlib
-import http.server
 import json
 import os
-import queue
-import re
 import signal
 import shutil
-import socket
-import struct
 import subprocess
-import sys
-import tarfile
 import termios
 import threading
 import time
-import tempfile
 import uuid
 import warnings
-import zlib
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit
-from urllib.request import Request, urlopen
-
-ROOT = Path(__file__).resolve().parent
-EXAMPLE_DIR = ROOT / "example"
-if str(EXAMPLE_DIR) not in sys.path:
-    sys.path.insert(0, str(EXAMPLE_DIR))
 
 import grpc
 
 from cri_common import configure_logging, labels_match, log_rpc, logger, normalize_image_ref
+# Compatibility re-exports: tests and local scripts import these helpers from pnfroot.
+from image_store import (
+    DEFAULT_IMAGE_SIZE,
+    IMAGE_METADATA_FILE,
+    IMAGE_PLATFORM,
+    REGISTRY_LAYER_MEDIA_TYPES,
+    REGISTRY_MANIFEST_ACCEPT,
+    RegistryClient,
+    blob_path,
+    cri_time_ns,
+    extract_tar_safe,
+    image_dir_has_layers,
+    image_dir_name,
+    image_metadata,
+    manifest_is_index,
+    parse_image_reference_for_registry,
+    parse_www_authenticate,
+    path_size,
+    platform_parts,
+    pull_image_to_store,
+    pull_registry_image_to_store,
+    read_image_metadata,
+    registry_scheme,
+    select_platform_manifest,
+    sha256_bytes,
+    sha256_file,
+    unpack_image_to_rootfs,
+    write_blob_bytes,
+    write_blob_payload,
+    write_image_metadata,
+)
+from image_service import ImageService
 import ptrace_syscalls
+# Compatibility re-exports for CRI streaming constants/classes.
+from streaming import (
+    CHANNEL_PROTOCOLS,
+    ExecStreamRequest,
+    RemoteCommandHTTPServer,
+    RemoteCommandRequestHandler,
+    RemoteCommandServer,
+    SPDY_FLAG_FIN,
+    SPDY_HEADER_DICTIONARY,
+    SPDY_STATUS_CANCEL,
+    SPDY_TYPE_GOAWAY,
+    SPDY_TYPE_HEADERS,
+    SPDY_TYPE_PING,
+    SPDY_TYPE_RST_STREAM,
+    SPDY_TYPE_SETTINGS,
+    SPDY_TYPE_SYN_REPLY,
+    SPDY_TYPE_SYN_STREAM,
+    SPDY_TYPE_WINDOW_UPDATE,
+    SPDY_UPGRADE,
+    SPDY_VERSION,
+    STREAM_CLOSE,
+    STREAM_ERROR,
+    STREAM_HOST,
+    STREAM_PORT,
+    STREAM_RESIZE,
+    STREAM_STDERR,
+    STREAM_STDIN,
+    STREAM_STDOUT,
+    STREAM_TOKEN_TTL_SECONDS,
+    SpdyRemoteCommandConnection,
+    WebSocketConnection,
+    WEBSOCKET_GUID,
+    WEBSOCKET_PROTOCOLS,
+)
 import tools.api_pb2 as api_pb2
 import tools.api_pb2_grpc as api_pb2_grpc
 
 
+ROOT = Path(__file__).resolve().parent
 SOCKET_PATH = "/tmp/pnfroot.sock"
 IMAGE_STORE_DIR = "/tmp/pnfroot/images"
 CONTAINER_STORE_DIR = "/tmp/pnfroot/containers"
-IMAGE_PLATFORM = "linux/amd64"
-DEFAULT_IMAGE_SIZE = 1
-IMAGE_METADATA_FILE = "pnfroot-image.json"
 ROOTFS_METADATA_FILE = "pnfroot-rootfs.json"
 RUNTIME_STATE_FILE = "pnfroot-runtime-state.json"
-STREAM_HOST = "127.0.0.1"
-STREAM_PORT = 0
-STREAM_TOKEN_TTL_SECONDS = 300
-WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-CHANNEL_PROTOCOLS = (
-    "v5.channel.k8s.io",
-    "v4.channel.k8s.io",
-    "v3.channel.k8s.io",
-    "v2.channel.k8s.io",
-    "channel.k8s.io",
-)
-WEBSOCKET_PROTOCOLS = (
-    "v5.channel.k8s.io",
-    "v4.channel.k8s.io",
-    "v3.channel.k8s.io",
-    "v2.channel.k8s.io",
-    "channel.k8s.io",
-    "v4.base64.channel.k8s.io",
-    "v3.base64.channel.k8s.io",
-    "v2.base64.channel.k8s.io",
-    "base64.channel.k8s.io",
-)
-STREAM_STDIN = 0
-STREAM_STDOUT = 1
-STREAM_STDERR = 2
-STREAM_ERROR = 3
-STREAM_RESIZE = 4
-STREAM_CLOSE = 255
-SPDY_UPGRADE = "SPDY/3.1"
-SPDY_VERSION = 3
-SPDY_TYPE_SYN_STREAM = 0x0001
-SPDY_TYPE_SYN_REPLY = 0x0002
-SPDY_TYPE_RST_STREAM = 0x0003
-SPDY_TYPE_SETTINGS = 0x0004
-SPDY_TYPE_PING = 0x0006
-SPDY_TYPE_GOAWAY = 0x0007
-SPDY_TYPE_HEADERS = 0x0008
-SPDY_TYPE_WINDOW_UPDATE = 0x0009
-SPDY_FLAG_FIN = 0x01
-SPDY_STATUS_CANCEL = 5
-SPDY_HEADER_DICTIONARY = base64.b64decode(
-    b"AAAAB29wdGlvbnMAAAAEaGVhZAAAAARwb3N0AAAAA3B1dAAAAAZkZWxldGUAAAAFdHJhY2UAAAAG"
-    b"YWNjZXB0AAAADmFjY2VwdC1jaGFyc2V0AAAAD2FjY2VwdC1lbmNvZGluZwAAAA9hY2NlcHQtbGFu"
-    b"Z3VhZ2UAAAANYWNjZXB0LXJhbmdlcwAAAANhZ2UAAAAFYWxsb3cAAAANYXV0aG9yaXphdGlvbgAA"
-    b"AA1jYWNoZS1jb250cm9sAAAACmNvbm5lY3Rpb24AAAAMY29udGVudC1iYXNlAAAAEGNvbnRlbnQt"
-    b"ZW5jb2RpbmcAAAAQY29udGVudC1sYW5ndWFnZQAAAA5jb250ZW50LWxlbmd0aAAAABBjb250ZW50"
-    b"LWxvY2F0aW9uAAAAC2NvbnRlbnQtbWQ1AAAADWNvbnRlbnQtcmFuZ2UAAAAMY29udGVudC10eXBl"
-    b"AAAABGRhdGUAAAAEZXRhZwAAAAZleHBlY3QAAAAHZXhwaXJlcwAAAARmcm9tAAAABGhvc3QAAAAI"
-    b"aWYtbWF0Y2gAAAARaWYtbW9kaWZpZWQtc2luY2UAAAANaWYtbm9uZS1tYXRjaAAAAAhpZi1yYW5n"
-    b"ZQAAABNpZi11bm1vZGlmaWVkLXNpbmNlAAAADWxhc3QtbW9kaWZpZWQAAAAIbG9jYXRpb24AAAAM"
-    b"bWF4LWZvcndhcmRzAAAABnByYWdtYQAAABJwcm94eS1hdXRoZW50aWNhdGUAAAATcHJveHktYXV0"
-    b"aG9yaXphdGlvbgAAAAVyYW5nZQAAAAdyZWZlcmVyAAAAC3JldHJ5LWFmdGVyAAAABnNlcnZlcgAA"
-    b"AAJ0ZQAAAAd0cmFpbGVyAAAAEXRyYW5zZmVyLWVuY29kaW5nAAAAB3VwZ3JhZGUAAAAKdXNlci1h"
-    b"Z2VudAAAAAR2YXJ5AAAAA3ZpYQAAAAd3YXJuaW5nAAAAEHd3dy1hdXRoZW50aWNhdGUAAAAGbWV0"
-    b"aG9kAAAAA2dldAAAAAZzdGF0dXMAAAAGMjAwIE9LAAAAB3ZlcnNpb24AAAAISFRUUC8xLjEAAAAD"
-    b"dXJsAAAABnB1YmxpYwAAAApzZXQtY29va2llAAAACmtlZXAtYWxpdmUAAAAGb3JpZ2luMTAwMTAx"
-    b"MjAxMjAyMjA1MjA2MzAwMzAyMzAzMzA0MzA1MzA2MzA3NDAyNDA1NDA2NDA3NDA4NDA5NDEwNDEx"
-    b"NDEyNDEzNDE0NDE1NDE2NDE3NTAyNTA0NTA1MjAzIE5vbi1BdXRob3JpdGF0aXZlIEluZm9ybWF0"
-    b"aW9uMjA0IE5vIENvbnRlbnQzMDEgTW92ZWQgUGVybWFuZW50bHk0MDAgQmFkIFJlcXVlc3Q0MDEg"
-    b"VW5hdXRob3JpemVkNDAzIEZvcmJpZGRlbjQwNCBOb3QgRm91bmQ1MDAgSW50ZXJuYWwgU2VydmVy"
-    b"IEVycm9yNTAxIE5vdCBJbXBsZW1lbnRlZDUwMyBTZXJ2aWNlIFVuYXZhaWxhYmxlSmFuIEZlYiBN"
-    b"YXIgQXByIE1heSBKdW4gSnVsIEF1ZyBTZXB0IE9jdCBOb3YgRGVjIDAwOjAwOjAwIE1vbiwgVHVl"
-    b"LCBXZWQsIFRodSwgRnJpLCBTYXQsIFN1biwgR01UY2h1bmtlZCx0ZXh0L2h0bWwsaW1hZ2UvcG5n"
-    b"LGltYWdlL2pwZyxpbWFnZS9naWYsYXBwbGljYXRpb24veG1sLGFwcGxpY2F0aW9uL3hodG1sK3ht"
-    b"bCx0ZXh0L3BsYWluLHRleHQvamF2YXNjcmlwdCxwdWJsaWNwcml2YXRlbWF4LWFnZT1nemlwLGRl"
-    b"ZmxhdGUsc2RjaGNoYXJzZXQ9dXRmLThjaGFyc2V0PWlzby04ODU5LTEsdXRmLSwqLGVucT0wLg=="
-)
-REGISTRY_MANIFEST_ACCEPT = ", ".join(
-    [
-        "application/vnd.oci.image.index.v1+json",
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-        "application/vnd.oci.image.manifest.v1+json",
-        "application/vnd.docker.distribution.manifest.v2+json",
-    ]
-)
-REGISTRY_LAYER_MEDIA_TYPES = {
-    "application/vnd.oci.image.layer.v1.tar",
-    "application/vnd.oci.image.layer.v1.tar+gzip",
-    "application/vnd.docker.image.rootfs.diff.tar",
-    "application/vnd.docker.image.rootfs.diff.tar.gzip",
-}
-
-
-def cri_time_ns() -> str:
-    ns = time.time_ns()
-    sec = ns // 1_000_000_000
-    nsec = ns % 1_000_000_000
-    base = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(sec))
-    return f"{base}.{nsec:09d}Z"
 
 
 def pipe_to_cri_log(pipe, log_path: str, stream: str) -> None:
@@ -149,54 +105,6 @@ def pipe_to_cri_log(pipe, log_path: str, stream: str) -> None:
         for line in iter(pipe.readline, b""):
             ts = cri_time_ns().encode()
             handle.write(ts + b" " + stream.encode() + b" F " + line)
-
-
-def path_size(path: Path) -> int:
-    total = 0
-    for item in path.rglob("*"):
-        if item.is_file():
-            total += item.stat().st_size
-    return total or DEFAULT_IMAGE_SIZE
-
-
-def image_metadata(image_ref: str, image_path: Path) -> dict[str, Any]:
-    return {
-        "id": image_ref,
-        "image_id": image_ref,
-        "repo_tags": [image_ref],
-        "size": path_size(image_path),
-        "path": str(image_path),
-    }
-
-
-def infer_image_ref_from_dir_name(name: str) -> str:
-    if name.endswith("_latest") and len(name) > len("_latest"):
-        return f"{name[:-len('_latest')]}:latest"
-    return name
-
-
-def write_image_metadata(img: dict[str, Any]) -> None:
-    metadata_path = Path(img["path"]) / IMAGE_METADATA_FILE
-    with open(metadata_path, "w", encoding="utf-8") as handle:
-        json.dump(img, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-
-def read_image_metadata(image_path: Path) -> dict[str, Any] | None:
-    metadata_path = image_path / IMAGE_METADATA_FILE
-    if not metadata_path.exists():
-        return None
-    try:
-        with open(metadata_path, "r", encoding="utf-8") as handle:
-            data = handle.read()
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError:
-            legacy = ast.literal_eval(data)
-            return legacy if isinstance(legacy, dict) else None
-    except Exception as exc:  # pragma: no cover - defensive fallback
-        logger.warning("Cannot read image metadata %s: %s", metadata_path, exc)
-        return None
 
 
 def encode_proto(message: Any | None) -> str:
@@ -210,6 +118,26 @@ def decode_proto(message_cls: Any, payload: str | None) -> Any:
     if payload:
         message.ParseFromString(base64.b64decode(payload.encode("ascii")))
     return message
+
+
+def env_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="surrogateescape")
+    return str(value)
+
+
+def normalize_envs(envs: Any) -> dict[str, str]:
+    if not envs:
+        return {}
+
+    if hasattr(envs, "items"):
+        items = envs.items()
+    else:
+        items = ((env.key, env.value) for env in envs)
+
+    return {env_text(key): env_text(value) for key, value in items}
 
 
 def process_status_to_returncode(status: int) -> int:
@@ -292,1448 +220,20 @@ class ContainerizedProcess:
                 pass
 
 
-def image_dir_name(image_ref: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", image_ref).strip("_")
-    return name or "image"
-
-
-def is_local_image_reference(image: str) -> bool:
-    if not image:
-        return False
-    expanded = os.path.expanduser(image)
-    return (
-        expanded.startswith("/")
-        or expanded.startswith("./")
-        or expanded.startswith("../")
-        or image.startswith("file://")
-    )
-
-
-def local_image_source_exists(image: str) -> bool:
-    try:
-        resolve_local_image_source(image)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def resolve_local_image_source(image: str) -> Path:
-    aliases = []
-    if image:
-        if image.startswith("file://"):
-            aliases.append(urlsplit(image).path)
-        aliases.append(image)
-        aliases.append(image.split("@", 1)[0].split(":", 1)[0])
-        aliases.append(image.rsplit("/", 1)[-1].split("@", 1)[0].split(":", 1)[0])
-        aliases.append(image.replace(":", "_"))
-        aliases.append(image.split("/", 1)[-1].replace(":", "_"))
-
-    candidates = []
-    for alias in aliases:
-        if not alias:
-            continue
-        candidates.extend([
-            Path(alias),
-            Path.cwd() / alias,
-            ROOT / alias,
-            EXAMPLE_DIR / alias,
-        ])
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    raise FileNotFoundError(f"cannot resolve image {image!r} from local filesystem")
-
-
-def pull_image_to_dir(image: str, output: str, platform: str = IMAGE_PLATFORM) -> str:
-    """Unpack a local image fixture into a rootfs directory."""
-
-    output_path = Path(output)
-    output_path.mkdir(parents=True, exist_ok=True)
-    source = resolve_local_image_source(image)
-    if source.is_dir():
-        _copy_tree_safe(source, output_path)
-        return str(output_path)
-    if source.is_file():
-        shutil.copy2(source, output_path / source.name)
-        return str(output_path)
-    raise FileNotFoundError(f"cannot resolve image {image!r} from local filesystem")
-
-
-def blob_path(image_path: Path, digest: str) -> Path:
-    algorithm, hex_digest = digest.split(":", 1)
-    return image_path / "blobs" / algorithm / hex_digest
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
-
-
-def sha256_bytes(payload: bytes) -> str:
-    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
-
-
-def write_blob_bytes(image_path: Path, payload: bytes) -> tuple[str, int]:
-    digest = sha256_bytes(payload)
-    return write_blob_payload(image_path, digest, payload)
-
-
-def write_blob_payload(image_path: Path, digest: str, payload: bytes) -> tuple[str, int]:
-    actual_digest = sha256_bytes(payload)
-    if actual_digest != digest:
-        raise ValueError(f"blob digest mismatch: expected {digest}, got {actual_digest}")
-    target = blob_path(image_path, digest)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        tmp_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-        with open(tmp_path, "wb") as handle:
-            handle.write(payload)
-        os.replace(tmp_path, target)
-    return digest, len(payload)
-
-
-def store_blob_file(image_path: Path, source: Path) -> tuple[str, int]:
-    digest = sha256_file(source)
-    target = blob_path(image_path, digest)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        shutil.copy2(source, target)
-    return digest, target.stat().st_size
-
-
-def create_layer_blob(rootfs: Path, image_path: Path, exclude_names: set[str] | None = None) -> tuple[str, int]:
-    image_path.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(prefix="layer-", suffix=".tar", dir=image_path.parent, delete=False) as handle:
-        tmp_path = Path(handle.name)
-    try:
-        with tarfile.open(tmp_path, "w", format=tarfile.PAX_FORMAT) as archive:
-            for item in sorted(rootfs.iterdir(), key=lambda path: path.name):
-                if exclude_names and item.name in exclude_names:
-                    continue
-                archive.add(item, arcname=item.name, recursive=True)
-        return store_blob_file(image_path, tmp_path)
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-
-
-def parse_image_reference_for_registry(image: str) -> tuple[str, str, str]:
-    ref = image.removeprefix("docker://")
-    if "://" in ref:
-        raise ValueError(f"unsupported image reference scheme: {image}")
-
-    digest = None
-    if "@" in ref:
-        name, digest = ref.split("@", 1)
-        reference = digest
-    else:
-        name = ref
-        last_component = ref.rsplit("/", 1)[-1]
-        if ":" in last_component:
-            name, reference = ref.rsplit(":", 1)
-        else:
-            reference = "latest"
-
-    if not name:
-        raise ValueError(f"invalid image reference: {image}")
-
-    parts = name.split("/")
-    if len(parts) == 1:
-        return "registry-1.docker.io", f"library/{parts[0]}", reference
-
-    first = parts[0]
-    if "." in first or ":" in first or first == "localhost":
-        registry = "registry-1.docker.io" if first == "docker.io" else first
-        repository = "/".join(parts[1:])
-    else:
-        registry = "registry-1.docker.io"
-        repository = name
-
-    if not repository:
-        raise ValueError(f"invalid image reference: {image}")
-    return registry, repository, reference
-
-
-def registry_scheme(registry: str) -> str:
-    if registry.startswith("localhost") or registry.startswith("127.") or registry.startswith("[::1]"):
-        return "http"
-    return "https"
-
-
-def parse_www_authenticate(header: str) -> tuple[str, dict[str, str]]:
-    scheme, _, params_text = header.partition(" ")
-    params: dict[str, str] = {}
-    for match in re.finditer(r'([A-Za-z_][A-Za-z0-9_-]*)=(?:"([^"]*)"|([^,]*))', params_text):
-        params[match.group(1).lower()] = match.group(2) if match.group(2) is not None else match.group(3).strip()
-    return scheme.lower(), params
-
-
-class RegistryClient:
-    def __init__(self, registry: str):
-        self.registry = registry
-        self.base_url = f"{registry_scheme(registry)}://{registry}"
-        self._bearer_token: str | None = None
-
-    def get_manifest(self, repository: str, reference: str) -> tuple[bytes, Any]:
-        return self.get(
-            f"/v2/{repository}/manifests/{quote(reference, safe=':@')}",
-            accept=REGISTRY_MANIFEST_ACCEPT,
-        )
-
-    def get_blob(self, repository: str, digest: str) -> tuple[bytes, Any]:
-        return self.get(f"/v2/{repository}/blobs/{quote(digest, safe=':')}")
-
-    def get(self, path: str, accept: str | None = None) -> tuple[bytes, Any]:
-        url = path if path.startswith("http://") or path.startswith("https://") else self.base_url + path
-        return self._request(url, accept=accept, retry_auth=True)
-
-    def _request(self, url: str, accept: str | None = None, retry_auth: bool = True) -> tuple[bytes, Any]:
-        headers = {"User-Agent": "pnfroot/0.1"}
-        if accept:
-            headers["Accept"] = accept
-        if self._bearer_token:
-            headers["Authorization"] = f"Bearer {self._bearer_token}"
-        request = Request(url, headers=headers)
-        try:
-            with urlopen(request, timeout=60) as response:
-                return response.read(), response.headers
-        except Exception as exc:
-            code = getattr(exc, "code", None)
-            auth_header = getattr(exc, "headers", {}).get("WWW-Authenticate") if getattr(exc, "headers", None) else None
-            if code == 401 and retry_auth and auth_header:
-                self._bearer_token = self._fetch_bearer_token(auth_header)
-                return self._request(url, accept=accept, retry_auth=False)
-            raise
-
-    def _fetch_bearer_token(self, auth_header: str) -> str:
-        scheme, params = parse_www_authenticate(auth_header)
-        if scheme != "bearer" or not params.get("realm"):
-            raise PermissionError(f"unsupported registry auth challenge: {auth_header}")
-        query = dict(parse_qsl(urlsplit(params["realm"]).query))
-        for key in ("service", "scope"):
-            if params.get(key):
-                query[key] = params[key]
-        token_url = params["realm"].split("?", 1)[0]
-        if query:
-            token_url = f"{token_url}?{urlencode(query)}"
-        request = Request(token_url, headers={"User-Agent": "pnfroot/0.1"})
-        with urlopen(request, timeout=60) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        token = payload.get("token") or payload.get("access_token")
-        if not token:
-            raise PermissionError("registry token response did not include a token")
-        return token
-
-
-def platform_parts(platform: str) -> tuple[str, str, str | None]:
-    parts = platform.split("/")
-    if len(parts) < 2:
-        raise ValueError(f"invalid platform: {platform}")
-    variant = parts[2] if len(parts) > 2 else None
-    return parts[0], parts[1], variant
-
-
-def manifest_is_index(manifest: dict[str, Any]) -> bool:
-    media_type = manifest.get("mediaType", "")
-    return media_type in {
-        "application/vnd.oci.image.index.v1+json",
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-    } or bool(manifest.get("manifests"))
-
-
-def select_platform_manifest(index: dict[str, Any], platform: str) -> dict[str, Any]:
-    want_os, want_arch, want_variant = platform_parts(platform)
-    fallback = None
-    for descriptor in index.get("manifests", []):
-        entry_platform = descriptor.get("platform") or {}
-        if entry_platform.get("os") != want_os or entry_platform.get("architecture") != want_arch:
-            continue
-        entry_variant = entry_platform.get("variant")
-        if want_variant is None or entry_variant == want_variant:
-            return descriptor
-        fallback = fallback or descriptor
-    if fallback is not None:
-        return fallback
-    raise FileNotFoundError(f"no {platform} manifest in image index")
-
-
-def pull_registry_image_to_store(image: str, image_store_dir: str | os.PathLike[str], platform: str = IMAGE_PLATFORM) -> dict[str, Any]:
-    image_ref = normalize_image_ref(image.removeprefix("docker://"))
-    image_path = Path(image_store_dir) / image_dir_name(image_ref)
-    image_path.mkdir(parents=True, exist_ok=True)
-
-    registry, repository, reference = parse_image_reference_for_registry(image)
-    client = RegistryClient(registry)
-    manifest_payload, manifest_headers = client.get_manifest(repository, reference)
-    manifest = json.loads(manifest_payload.decode("utf-8"))
-
-    if manifest_is_index(manifest):
-        descriptor = select_platform_manifest(manifest, platform)
-        manifest_payload, manifest_headers = client.get_manifest(repository, descriptor["digest"])
-        manifest = json.loads(manifest_payload.decode("utf-8"))
-
-    if manifest.get("schemaVersion") != 2 or not manifest.get("layers"):
-        raise ValueError(f"unsupported image manifest for {image}")
-
-    manifest_digest = manifest_headers.get("Docker-Content-Digest") or sha256_bytes(manifest_payload)
-    write_blob_payload(image_path, manifest_digest, manifest_payload)
-
-    config = manifest.get("config") or {}
-    config_digest = config.get("digest")
-    if not config_digest:
-        raise ValueError(f"image manifest has no config digest: {image}")
-    config_payload, _ = client.get_blob(repository, config_digest)
-    _, config_size = write_blob_payload(image_path, config_digest, config_payload)
-
-    layer_digests: list[str] = []
-    total_size = len(manifest_payload) + config_size
-    for layer in manifest.get("layers", []):
-        media_type = layer.get("mediaType", "")
-        digest = layer.get("digest")
-        if not digest:
-            raise ValueError(f"image layer has no digest: {image}")
-        if media_type and media_type not in REGISTRY_LAYER_MEDIA_TYPES:
-            raise ValueError(f"unsupported layer media type {media_type!r} for {image}")
-        target = blob_path(image_path, digest)
-        if target.exists() and sha256_file(target) == digest:
-            layer_size = target.stat().st_size
-        else:
-            layer_payload, _ = client.get_blob(repository, digest)
-            _, layer_size = write_blob_payload(image_path, digest, layer_payload)
-        layer_digests.append(digest)
-        total_size += layer_size
-
-    img = image_metadata(image_ref, image_path)
-    img.update(
-        {
-            "image_id": manifest_digest,
-            "manifest_digest": manifest_digest,
-            "manifest_size": len(manifest_payload),
-            "config_digest": config_digest,
-            "layer_digests": layer_digests,
-            "size": total_size,
-            "source_type": "registry",
-            "source_image": image,
-            "registry": registry,
-            "repository": repository,
-            "platform": platform,
-        }
-    )
-    write_image_metadata(img)
-    return img
-
-
-def pull_image_to_store(image: str, image_store_dir: str | os.PathLike[str], platform: str = IMAGE_PLATFORM) -> dict[str, Any]:
-    image_ref = normalize_image_ref(image.removeprefix("docker://"))
-    image_path = Path(image_store_dir) / image_dir_name(image_ref)
-    image_path.mkdir(parents=True, exist_ok=True)
-    try:
-        source = resolve_local_image_source(image)
-    except FileNotFoundError:
-        if is_local_image_reference(image):
-            raise
-        return pull_registry_image_to_store(image, image_store_dir=image_store_dir, platform=platform)
-    if not source.is_dir():
-        raise FileNotFoundError(f"image source {source} is not an unpacked rootfs directory")
-
-    layer_digest, layer_size = create_layer_blob(source, image_path)
-    config_payload = json.dumps(
-        {
-            "architecture": "amd64",
-            "os": "linux",
-            "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
-            "created": cri_time_ns(),
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    config_digest, config_size = write_blob_bytes(image_path, config_payload)
-    manifest_payload = json.dumps(
-        {
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest,
-                "size": config_size,
-            },
-            "layers": [
-                {
-                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
-                    "digest": layer_digest,
-                    "size": layer_size,
-                }
-            ],
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    manifest_digest, manifest_size = write_blob_bytes(image_path, manifest_payload)
-    img = image_metadata(image_ref, image_path)
-    img.update(
-        {
-            "image_id": manifest_digest,
-            "manifest_digest": manifest_digest,
-            "manifest_size": manifest_size,
-            "config_digest": config_digest,
-            "layer_digests": [layer_digest],
-            "size": layer_size + config_size + manifest_size,
-            "source_type": "local-rootfs",
-            "source_image": image,
-            "platform": platform,
-        }
-    )
-    write_image_metadata(img)
-    return img
-
-
-def image_dir_has_layers(image_path: Path) -> bool:
-    img = read_image_metadata(image_path)
-    return bool(img and img.get("layer_digests"))
-
-
-def migrate_legacy_rootfs_image(image_path: Path, image_ref: str) -> dict[str, Any]:
-    layer_digest, layer_size = create_layer_blob(
-        image_path,
-        image_path,
-        exclude_names={"blobs", IMAGE_METADATA_FILE},
-    )
-    config_payload = json.dumps(
-        {
-            "architecture": "amd64",
-            "os": "linux",
-            "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
-            "created": cri_time_ns(),
-            "pnfrootLegacyMigration": True,
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    config_digest, config_size = write_blob_bytes(image_path, config_payload)
-    manifest_payload = json.dumps(
-        {
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest,
-                "size": config_size,
-            },
-            "layers": [
-                {
-                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
-                    "digest": layer_digest,
-                    "size": layer_size,
-                }
-            ],
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    manifest_digest, manifest_size = write_blob_bytes(image_path, manifest_payload)
-    img = image_metadata(image_ref, image_path)
-    img.update(
-        {
-            "image_id": manifest_digest,
-            "manifest_digest": manifest_digest,
-            "manifest_size": manifest_size,
-            "config_digest": config_digest,
-            "layer_digests": [layer_digest],
-            "size": layer_size + config_size + manifest_size,
-            "source_type": "legacy-rootfs",
-            "source_image": image_ref,
-        }
-    )
-    write_image_metadata(img)
-    cleanup_legacy_rootfs_entries(image_path)
-    return img
-
-
-def cleanup_legacy_rootfs_entries(image_path: Path) -> None:
-    for item in image_path.iterdir():
-        if item.name in {"blobs", IMAGE_METADATA_FILE}:
-            continue
-        if item.is_symlink() or item.is_file():
-            item.unlink()
-        elif item.is_dir():
-            shutil.rmtree(item)
-
-
-def unpack_image_to_rootfs(image_path: Path, rootfs_path: Path) -> Path:
-    img = read_image_metadata(image_path)
-    if img is None:
-        raise FileNotFoundError(f"image metadata not found in {image_path}")
-    layer_digests = img.get("layer_digests") or []
-    if not layer_digests:
-        raise FileNotFoundError(f"image has no layers: {image_path}")
-    if rootfs_path.exists():
-        shutil.rmtree(rootfs_path)
-    rootfs_path.mkdir(parents=True, exist_ok=True)
-    try:
-        for digest in layer_digests:
-            extract_tar_safe(blob_path(image_path, digest), rootfs_path)
-    except Exception:
-        shutil.rmtree(rootfs_path, ignore_errors=True)
-        raise
-    return rootfs_path
-
-
-def extract_tar_safe(layer_path: Path, rootfs_path: Path) -> None:
-    rootfs = rootfs_path.resolve()
-    with tarfile.open(layer_path, "r:*") as archive:
-        for member in archive:
-            name = member.name.lstrip("./")
-            if not name:
-                continue
-            target = (rootfs / name).resolve()
-            if target != rootfs and rootfs not in target.parents:
-                raise ValueError(f"unsafe image layer path: {member.name}")
-
-            base = os.path.basename(name)
-            parent = target.parent
-
-            if base.startswith(".wh."):
-                if base == ".wh..wh..opq":
-                    if parent.exists():
-                        for child in parent.iterdir():
-                            if child.is_dir() and not child.is_symlink():
-                                shutil.rmtree(child)
-                            else:
-                                child.unlink(missing_ok=True)
-                else:
-                    victim = parent / base[4:]
-                    if victim.is_dir() and not victim.is_symlink():
-                        shutil.rmtree(victim)
-                    else:
-                        victim.unlink(missing_ok=True)
-                continue
-
-            archive.extract(member, rootfs, filter="fully_trusted")
-
-
-def _copy_tree_safe(src: Path, dst: Path) -> None:
-    for item in src.iterdir():
-        target = dst / item.name
-        if item.is_symlink():
-            if os.path.lexists(target):
-                target.unlink()
-            target.symlink_to(os.readlink(item))
-            continue
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            _copy_tree_safe(item, target)
-        elif item.is_file():
-            shutil.copy2(item, target)
-
-
-class ExecStreamRequest:
-    def __init__(
-        self,
-        *,
-        container_id: str,
-        cmd: list[str],
-        tty: bool,
-        stdin: bool,
-        stdout: bool,
-        stderr: bool,
-        created_at: float,
-    ):
-        self.container_id = container_id
-        self.cmd = cmd
-        self.tty = tty
-        self.stdin = stdin
-        self.stdout = stdout
-        self.stderr = stderr
-        self.created_at = created_at
-
-
-class RemoteCommandHTTPServer(http.server.ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-class WebSocketConnection:
-    def __init__(self, sock: socket.socket, protocol: str):
-        self.sock = sock
-        self.protocol = protocol
-        self.base64_channel = "base64" in protocol
-        self.write_lock = threading.Lock()
-        self.closed = False
-
-    @classmethod
-    def accept(cls, handler: http.server.BaseHTTPRequestHandler, protocol: str) -> "WebSocketConnection":
-        key = handler.headers.get("Sec-WebSocket-Key")
-        if not key:
-            raise ValueError("missing Sec-WebSocket-Key")
-        try:
-            base64.b64decode(key.encode("ascii"), validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError("invalid Sec-WebSocket-Key") from exc
-
-        accept = base64.b64encode(hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()).decode("ascii")
-        headers = [
-            "HTTP/1.1 101 Switching Protocols",
-            "Upgrade: websocket",
-            "Connection: Upgrade",
-            f"Sec-WebSocket-Accept: {accept}",
-        ]
-        if protocol:
-            headers.append(f"Sec-WebSocket-Protocol: {protocol}")
-        handler.request.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii"))
-        return cls(handler.request, protocol)
-
-    def _recv_exact(self, size: int) -> bytes:
-        data = bytearray()
-        while len(data) < size:
-            chunk = self.sock.recv(size - len(data))
-            if not chunk:
-                raise EOFError("websocket closed")
-            data.extend(chunk)
-        return bytes(data)
-
-    def _send_frame(self, opcode: int, payload: bytes = b"") -> None:
-        if self.closed:
-            return
-        header = bytearray([0x80 | opcode])
-        length = len(payload)
-        if length < 126:
-            header.append(length)
-        elif length <= 0xFFFF:
-            header.extend([126])
-            header.extend(struct.pack("!H", length))
-        else:
-            header.extend([127])
-            header.extend(struct.pack("!Q", length))
-        with self.write_lock:
-            if self.closed:
-                return
-            self.sock.sendall(bytes(header) + payload)
-
-    def read_channel_message(self) -> tuple[int, bytes]:
-        while True:
-            first, second = self._recv_exact(2)
-            opcode = first & 0x0F
-            masked = bool(second & 0x80)
-            length = second & 0x7F
-            if length == 126:
-                length = struct.unpack("!H", self._recv_exact(2))[0]
-            elif length == 127:
-                length = struct.unpack("!Q", self._recv_exact(8))[0]
-
-            mask = self._recv_exact(4) if masked else b""
-            payload = self._recv_exact(length) if length else b""
-            if masked:
-                payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
-
-            if opcode == 0x8:
-                raise EOFError("websocket close frame")
-            if opcode == 0x9:
-                self._send_frame(0xA, payload)
-                continue
-            if opcode == 0xA:
-                continue
-            if opcode not in {0x1, 0x2}:
-                continue
-
-            if opcode == 0x1 or self.base64_channel:
-                payload = base64.b64decode(payload)
-            if not payload:
-                continue
-            return payload[0], payload[1:]
-
-    def send_channel(self, channel: int, data: bytes = b"") -> None:
-        payload = bytes([channel]) + data
-        if self.base64_channel:
-            self._send_frame(0x1, base64.b64encode(payload))
-        else:
-            self._send_frame(0x2, payload)
-
-    def close(self) -> None:
-        with self.write_lock:
-            if self.closed:
-                return
-            self.closed = True
-            try:
-                payload = struct.pack("!H", 1000)
-                header = bytes([0x88, len(payload)])
-                self.sock.sendall(header + payload)
-            except OSError:
-                pass
-            try:
-                self.sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-
-
-class SpdyRemoteCommandConnection:
-    channel_to_stream_type = {
-        STREAM_STDIN: "stdin",
-        STREAM_STDOUT: "stdout",
-        STREAM_STDERR: "stderr",
-        STREAM_ERROR: "error",
-        STREAM_RESIZE: "resize",
-    }
-    stream_type_to_channel = {
-        "stdin": STREAM_STDIN,
-        "stdout": STREAM_STDOUT,
-        "stderr": STREAM_STDERR,
-        "error": STREAM_ERROR,
-        "resize": STREAM_RESIZE,
-    }
-
-    def __init__(self, sock: socket.socket, protocol: str):
-        self.sock = sock
-        self.protocol = protocol
-        self.write_lock = threading.Lock()
-        self.closed = False
-        self.streams_by_id: dict[int, str] = {}
-        self.streams_by_type: dict[str, int] = {}
-        self.local_finished: set[int] = set()
-        self.remote_finished: set[int] = set()
-        self.incoming: queue.Queue[tuple[int, bytes]] = queue.Queue()
-        self.streams_changed = threading.Condition()
-        self.header_compressor = zlib.compressobj(
-            level=zlib.Z_BEST_COMPRESSION,
-            wbits=zlib.MAX_WBITS,
-            zdict=SPDY_HEADER_DICTIONARY,
-        )
-        self.header_decompressor = zlib.decompressobj(
-            wbits=zlib.MAX_WBITS,
-            zdict=SPDY_HEADER_DICTIONARY,
-        )
-        self.reader = threading.Thread(target=self._read_loop, name="pnfroot-spdy", daemon=True)
-        self.reader.start()
-
-    @classmethod
-    def accept(cls, handler: http.server.BaseHTTPRequestHandler, protocol: str) -> "SpdyRemoteCommandConnection":
-        headers = [
-            "HTTP/1.1 101 Switching Protocols",
-            "Connection: Upgrade",
-            f"Upgrade: {SPDY_UPGRADE}",
-            f"X-Stream-Protocol-Version: {protocol}",
-        ]
-        handler.request.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii"))
-        return cls(handler.request, protocol)
-
-    def wait_for_streams(self, request: ExecStreamRequest, timeout: float = 30.0) -> None:
-        expected = {"error"}
-        if request.stdin:
-            expected.add("stdin")
-        if request.stdout:
-            expected.add("stdout")
-        if request.stderr and not request.tty:
-            expected.add("stderr")
-        deadline = time.monotonic() + timeout
-        with self.streams_changed:
-            while not expected.issubset(self.streams_by_type):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    missing = sorted(expected - set(self.streams_by_type))
-                    raise TimeoutError(f"timed out waiting for SPDY streams: {', '.join(missing)}")
-                self.streams_changed.wait(timeout=remaining)
-
-    def _recv_exact(self, size: int) -> bytes:
-        data = bytearray()
-        while len(data) < size:
-            chunk = self.sock.recv(size - len(data))
-            if not chunk:
-                raise EOFError("spdy closed")
-            data.extend(chunk)
-        return bytes(data)
-
-    def _read_loop(self) -> None:
-        try:
-            while not self.closed:
-                self._read_frame()
-        except (EOFError, OSError, zlib.error, struct.error):
-            pass
-        finally:
-            self.closed = True
-            self.incoming.put((STREAM_CLOSE, b""))
-            with self.streams_changed:
-                self.streams_changed.notify_all()
-
-    def _read_frame(self) -> None:
-        first_word = struct.unpack("!I", self._recv_exact(4))[0]
-        flags_and_length = struct.unpack("!I", self._recv_exact(4))[0]
-        flags = (flags_and_length >> 24) & 0xFF
-        length = flags_and_length & 0xFFFFFF
-        payload = self._recv_exact(length) if length else b""
-
-        if first_word & 0x80000000:
-            version = (first_word >> 16) & 0x7FFF
-            frame_type = first_word & 0xFFFF
-            if version != SPDY_VERSION:
-                raise EOFError(f"unsupported SPDY version {version}")
-            self._handle_control_frame(frame_type, flags, payload)
-            return
-
-        stream_id = first_word & 0x7FFFFFFF
-        self._handle_data_frame(stream_id, flags, payload)
-
-    def _handle_control_frame(self, frame_type: int, flags: int, payload: bytes) -> None:
-        if frame_type == SPDY_TYPE_SYN_STREAM:
-            self._handle_syn_stream(flags, payload)
-        elif frame_type == SPDY_TYPE_RST_STREAM:
-            if len(payload) >= 4:
-                stream_id = struct.unpack("!I", payload[:4])[0] & 0x7FFFFFFF
-                self._finish_remote_stream(stream_id)
-        elif frame_type == SPDY_TYPE_PING:
-            if len(payload) == 4:
-                self._write_control_frame(SPDY_TYPE_PING, 0, payload)
-        elif frame_type == SPDY_TYPE_GOAWAY:
-            raise EOFError("spdy goaway")
-        elif frame_type in {SPDY_TYPE_SETTINGS, SPDY_TYPE_HEADERS, SPDY_TYPE_WINDOW_UPDATE, SPDY_TYPE_SYN_REPLY}:
-            return
-
-    def _handle_syn_stream(self, flags: int, payload: bytes) -> None:
-        if len(payload) < 10:
-            return
-        stream_id = struct.unpack("!I", payload[:4])[0] & 0x7FFFFFFF
-        headers = self._parse_header_block(self.header_decompressor.decompress(payload[10:]))
-        stream_type = headers.get("streamtype", [""])[0]
-        if stream_type not in self.stream_type_to_channel:
-            self._write_rst_stream(stream_id, SPDY_STATUS_CANCEL)
-            return
-
-        with self.streams_changed:
-            self.streams_by_id[stream_id] = stream_type
-            self.streams_by_type[stream_type] = stream_id
-            if flags & SPDY_FLAG_FIN:
-                self.remote_finished.add(stream_id)
-            self.streams_changed.notify_all()
-        self._write_syn_reply(stream_id)
-        if flags & SPDY_FLAG_FIN:
-            self._queue_remote_finish(stream_id)
-
-    def _handle_data_frame(self, stream_id: int, flags: int, payload: bytes) -> None:
-        stream_type = self.streams_by_id.get(stream_id)
-        if stream_type is None:
-            return
-        channel = self.stream_type_to_channel[stream_type]
-        if payload and channel in {STREAM_STDIN, STREAM_RESIZE}:
-            self.incoming.put((channel, payload))
-        if flags & SPDY_FLAG_FIN:
-            self._finish_remote_stream(stream_id)
-
-    def _finish_remote_stream(self, stream_id: int) -> None:
-        if stream_id in self.remote_finished:
-            return
-        self.remote_finished.add(stream_id)
-        self._queue_remote_finish(stream_id)
-
-    def _queue_remote_finish(self, stream_id: int) -> None:
-        stream_type = self.streams_by_id.get(stream_id)
-        if stream_type == "stdin":
-            self.incoming.put((STREAM_CLOSE, bytes([STREAM_STDIN])))
-
-    def _parse_header_block(self, data: bytes) -> dict[str, list[str]]:
-        offset = 0
-        if len(data) < 4:
-            return {}
-        count = struct.unpack("!I", data[offset : offset + 4])[0]
-        offset += 4
-        headers: dict[str, list[str]] = {}
-        for _ in range(count):
-            if offset + 4 > len(data):
-                break
-            name_len = struct.unpack("!I", data[offset : offset + 4])[0]
-            offset += 4
-            name = data[offset : offset + name_len].decode("utf-8", "replace").lower()
-            offset += name_len
-            if offset + 4 > len(data):
-                break
-            value_len = struct.unpack("!I", data[offset : offset + 4])[0]
-            offset += 4
-            value = data[offset : offset + value_len].decode("utf-8", "replace")
-            offset += value_len
-            headers[name] = value.split("\x00") if value else [""]
-        return headers
-
-    def _header_block(self, headers: dict[str, list[str] | str]) -> bytes:
-        raw = bytearray()
-        raw.extend(struct.pack("!I", len(headers)))
-        for name, values in headers.items():
-            header_name = name.lower().encode("utf-8")
-            if isinstance(values, str):
-                header_value = values.encode("utf-8")
-            else:
-                header_value = "\x00".join(values).encode("utf-8")
-            raw.extend(struct.pack("!I", len(header_name)))
-            raw.extend(header_name)
-            raw.extend(struct.pack("!I", len(header_value)))
-            raw.extend(header_value)
-        return self.header_compressor.compress(bytes(raw)) + self.header_compressor.flush(zlib.Z_SYNC_FLUSH)
-
-    def _write_control_frame(self, frame_type: int, flags: int, payload: bytes) -> None:
-        header = struct.pack(
-            "!HHI",
-            0x8000 | SPDY_VERSION,
-            frame_type,
-            ((flags & 0xFF) << 24) | (len(payload) & 0xFFFFFF),
-        )
-        with self.write_lock:
-            if not self.closed:
-                self.sock.sendall(header + payload)
-
-    def _write_data_frame(self, stream_id: int, data: bytes = b"", fin: bool = False) -> None:
-        if stream_id in self.local_finished:
-            return
-        flags = SPDY_FLAG_FIN if fin else 0
-        header = struct.pack("!II", stream_id & 0x7FFFFFFF, (flags << 24) | (len(data) & 0xFFFFFF))
-        with self.write_lock:
-            if self.closed:
-                return
-            self.sock.sendall(header + data)
-            if fin:
-                self.local_finished.add(stream_id)
-
-    def _write_syn_reply(self, stream_id: int) -> None:
-        payload = struct.pack("!I", stream_id & 0x7FFFFFFF) + self._header_block({})
-        self._write_control_frame(SPDY_TYPE_SYN_REPLY, 0, payload)
-
-    def _write_rst_stream(self, stream_id: int, status: int) -> None:
-        self._write_control_frame(SPDY_TYPE_RST_STREAM, 0, struct.pack("!II", stream_id & 0x7FFFFFFF, status))
-
-    def read_channel_message(self) -> tuple[int, bytes]:
-        channel, payload = self.incoming.get()
-        if channel == STREAM_CLOSE and not payload:
-            raise EOFError("spdy closed")
-        return channel, payload
-
-    def send_channel(self, channel: int, data: bytes = b"") -> None:
-        stream_type = self.channel_to_stream_type.get(channel)
-        if stream_type is None:
-            return
-        with self.streams_changed:
-            stream_id = self.streams_by_type.get(stream_type)
-        if stream_id is None:
-            return
-        if data:
-            self._write_data_frame(stream_id, data)
-
-    def close(self) -> None:
-        already_closed = self.closed
-        if not already_closed:
-            for stream_id in list(self.streams_by_id):
-                try:
-                    self._write_data_frame(stream_id, fin=True)
-                except OSError:
-                    break
-            try:
-                last_stream_id = max(self.streams_by_id) if self.streams_by_id else 0
-                self._write_control_frame(SPDY_TYPE_GOAWAY, 0, struct.pack("!II", last_stream_id, 0))
-            except OSError:
-                pass
-        self.closed = True
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-
-
-class RemoteCommandRequestHandler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        logger.debug("stream %s - %s", self.address_string(), fmt % args)
-
-    def do_GET(self) -> None:
-        self._handle_request()
-
-    def do_POST(self) -> None:
-        self._handle_request()
-
-    def _handle_request(self) -> None:
-        manager: RemoteCommandServer = self.server.remote_command_server  # type: ignore[attr-defined]
-        parsed = urlsplit(self.path)
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) != 2 or parts[0] != "exec":
-            self.send_error(404, "not found")
-            return
-
-        request = manager.consume_exec(parts[1])
-        if request is None:
-            self.send_error(404, "exec request not found")
-            return
-
-        self.close_connection = True
-        if self._is_websocket_request():
-            protocol = manager.negotiate_websocket_protocol(self.headers.get("Sec-WebSocket-Protocol", ""))
-            if protocol is None:
-                self.send_error(400, "unsupported websocket protocol")
-                return
-            try:
-                stream = WebSocketConnection.accept(self, protocol)
-            except ValueError as exc:
-                self.send_error(400, str(exc))
-                return
-            manager.serve_exec(request, stream)
-            return
-
-        if self._is_spdy_request():
-            protocol = manager.negotiate_spdy_protocol(self.headers.get_all("X-Stream-Protocol-Version") or [])
-            if protocol is None:
-                self.send_error(400, "unsupported SPDY stream protocol")
-                return
-            stream = SpdyRemoteCommandConnection.accept(self, protocol)
-            manager.serve_exec(request, stream)
-            return
-
-        self.send_error(426, "websocket or SPDY upgrade required")
-
-    def _is_websocket_request(self) -> bool:
-        connection = self.headers.get("Connection", "").lower()
-        upgrade = self.headers.get("Upgrade", "").lower()
-        return "upgrade" in connection and upgrade == "websocket"
-
-    def _is_spdy_request(self) -> bool:
-        connection = self.headers.get("Connection", "").lower()
-        upgrade = self.headers.get("Upgrade", "").lower()
-        return "upgrade" in connection and upgrade == SPDY_UPGRADE.lower()
-
-
-class RemoteCommandServer:
-    def __init__(
-        self,
-        runtime: "RuntimeService",
-        host: str = STREAM_HOST,
-        port: int = STREAM_PORT,
-        public_host: str | None = None,
-        token_ttl_seconds: int = STREAM_TOKEN_TTL_SECONDS,
-    ):
-        self.runtime = runtime
-        self.host = host
-        self.port = port
-        self.public_host = public_host
-        self.token_ttl_seconds = token_ttl_seconds
-        self._lock = threading.Lock()
-        self._requests: dict[str, ExecStreamRequest] = {}
-        self._server: RemoteCommandHTTPServer | None = None
-        self._thread: threading.Thread | None = None
-        self.start()
-
-    @property
-    def base_url(self) -> str:
-        if self._server is None:
-            self.start()
-        assert self._server is not None
-        host = self.public_host or self.host
-        if host in {"", "0.0.0.0"}:
-            host = "127.0.0.1"
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        return f"http://{host}:{self._server.server_address[1]}"
-
-    def start(self) -> None:
-        if self._server is not None:
-            return
-        self._server = RemoteCommandHTTPServer((self.host, self.port), RemoteCommandRequestHandler)
-        self._server.remote_command_server = self  # type: ignore[attr-defined]
-        self._thread = threading.Thread(target=self._server.serve_forever, name="pnfroot-streaming", daemon=True)
-        self._thread.start()
-        logger.info("CRI streaming server started on %s", self.base_url)
-
-    def shutdown(self) -> None:
-        if self._server is None:
-            return
-        self._server.shutdown()
-        self._server.server_close()
-        self._server = None
-
-    def build_exec_url(self, request: ExecStreamRequest) -> str:
-        token = uuid.uuid4().hex
-        with self._lock:
-            self._drop_expired_locked()
-            self._requests[token] = request
-        return f"{self.base_url}/exec/{token}"
-
-    def consume_exec(self, token: str) -> ExecStreamRequest | None:
-        with self._lock:
-            request = self._requests.pop(token, None)
-            if request is None:
-                return None
-            if time.time() - request.created_at > self.token_ttl_seconds:
-                return None
-            return request
-
-    def _drop_expired_locked(self) -> None:
-        now = time.time()
-        expired = [
-            token
-            for token, request in self._requests.items()
-            if now - request.created_at > self.token_ttl_seconds
-        ]
-        for token in expired:
-            self._requests.pop(token, None)
-
-    def negotiate_websocket_protocol(self, offered_header: str) -> str | None:
-        if not offered_header:
-            return "channel.k8s.io"
-        offered = [item.strip() for item in offered_header.split(",") if item.strip()]
-        for protocol in offered:
-            if protocol in WEBSOCKET_PROTOCOLS:
-                return protocol
+def find_unique_prefix_key(items: dict[str, Any], item_id: str) -> str | None:
+    if item_id in items:
+        return item_id
+    matches = [full_id for full_id in items.keys() if full_id.startswith(item_id)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def find_unique_prefix_value(items: dict[str, Any], item_id: str) -> Any | None:
+    full_id = find_unique_prefix_key(items, item_id)
+    if full_id is None:
         return None
-
-    def negotiate_spdy_protocol(self, offered_headers: list[str]) -> str | None:
-        if not offered_headers:
-            return "channel.k8s.io"
-        offered: list[str] = []
-        for header in offered_headers:
-            offered.extend(item.strip() for item in header.split(",") if item.strip())
-        for protocol in offered:
-            if protocol in CHANNEL_PROTOCOLS:
-                return protocol
-        return None
-
-    def serve_exec(self, request: ExecStreamRequest, stream: Any) -> None:
-        stop_event = threading.Event()
-        process: Any = None
-        pty_master: int | None = None
-        stdin_closed = threading.Event()
-
-        def send_status(exit_code: int, message: str | None = None) -> None:
-            if stream.protocol in {"v4.channel.k8s.io", "v5.channel.k8s.io", "v4.base64.channel.k8s.io"}:
-                if exit_code == 0 and message is None:
-                    status = {"status": "Success"}
-                elif message is None:
-                    status = {
-                        "status": "Failure",
-                        "reason": "NonZeroExitCode",
-                        "message": f"command terminated with non-zero exit code: {exit_code}",
-                        "details": {
-                            "causes": [
-                                {
-                                    "reason": "ExitCode",
-                                    "message": str(exit_code),
-                                }
-                            ]
-                        },
-                    }
-                else:
-                    status = {
-                        "status": "Failure",
-                        "reason": "InternalError",
-                        "message": f"Internal error occurred: {message}",
-                        "code": 500,
-                    }
-                stream.send_channel(STREAM_ERROR, json.dumps(status, separators=(",", ":")).encode("utf-8"))
-            elif exit_code != 0 or message is not None:
-                stream.send_channel(STREAM_ERROR, (message or f"command exited with {exit_code}").encode("utf-8"))
-
-        def close_stdin() -> None:
-            if stdin_closed.is_set():
-                return
-            stdin_closed.set()
-            if process is not None and process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-
-        def pipe_to_channel(pipe: Any, channel: int) -> None:
-            try:
-                while not stop_event.is_set():
-                    data = pipe.read(32768)
-                    if not data:
-                        break
-                    stream.send_channel(channel, data)
-            except OSError:
-                pass
-            finally:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
-
-        def pty_to_stdout(fd: int) -> None:
-            try:
-                while not stop_event.is_set():
-                    try:
-                        data = os.read(fd, 32768)
-                    except OSError:
-                        break
-                    if not data:
-                        break
-                    stream.send_channel(STREAM_STDOUT, data)
-            finally:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-
-        def apply_resize(payload: bytes) -> None:
-            if pty_master is None:
-                return
-            try:
-                size = json.loads(payload.decode("utf-8"))
-                width = int(size.get("Width", size.get("width", 0)))
-                height = int(size.get("Height", size.get("height", 0)))
-                if width > 0 and height > 0:
-                    fcntl.ioctl(pty_master, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
-            except (OSError, ValueError, json.JSONDecodeError):
-                pass
-
-        def receive_loop() -> None:
-            try:
-                while not stop_event.is_set():
-                    channel, payload = stream.read_channel_message()
-                    if channel == STREAM_STDIN and request.stdin:
-                        if request.tty and pty_master is not None:
-                            os.write(pty_master, payload)
-                        elif process is not None and process.stdin is not None and not stdin_closed.is_set():
-                            process.stdin.write(payload)
-                            process.stdin.flush()
-                    elif channel == STREAM_RESIZE:
-                        apply_resize(payload)
-                    elif channel == STREAM_CLOSE:
-                        if payload and payload[0] == STREAM_STDIN:
-                            close_stdin()
-            except (EOFError, OSError, BrokenPipeError):
-                close_stdin()
-                if not stop_event.is_set() and process is not None and process.poll() is None:
-                    process.terminate()
-
-        output_threads: list[threading.Thread] = []
-        receiver: threading.Thread | None = None
-        try:
-            container = self.runtime.find_container(request.container_id)
-            if container is None:
-                send_status(1, "container not found")
-                return
-
-            if isinstance(stream, SpdyRemoteCommandConnection):
-                stream.wait_for_streams(request)
-
-            process, pty_master = self.runtime.start_exec_process(
-                container,
-                request.cmd,
-                tty=request.tty,
-                stdin=request.stdin,
-                stdout=request.stdout,
-                stderr=request.stderr,
-            )
-
-            if request.stdout:
-                stream.send_channel(STREAM_STDOUT, b"")
-            elif request.stderr:
-                stream.send_channel(STREAM_STDERR, b"")
-            else:
-                stream.send_channel(STREAM_ERROR, b"")
-
-            if request.tty and pty_master is not None:
-                output_threads.append(threading.Thread(target=pty_to_stdout, args=(pty_master,), daemon=True))
-            else:
-                if request.stdout and process.stdout is not None:
-                    output_threads.append(threading.Thread(target=pipe_to_channel, args=(process.stdout, STREAM_STDOUT), daemon=True))
-                if request.stderr and process.stderr is not None:
-                    output_threads.append(threading.Thread(target=pipe_to_channel, args=(process.stderr, STREAM_STDERR), daemon=True))
-
-            for thread in output_threads:
-                thread.start()
-
-            receiver = threading.Thread(target=receive_loop, daemon=True)
-            receiver.start()
-            exit_code = process.wait()
-            close_stdin()
-            for thread in output_threads:
-                thread.join(timeout=2)
-            send_status(exit_code)
-        except Exception as exc:
-            logger.exception("Exec stream failed")
-            send_status(1, str(exc))
-            if process is not None and process.poll() is None:
-                process.kill()
-        finally:
-            stop_event.set()
-            stream.close()
-            if receiver is not None:
-                receiver.join(timeout=1)
-
-
-class ImageService(api_pb2_grpc.ImageServiceServicer):
-    def __init__(self, image_store_dir: str | os.PathLike[str], platform: str = IMAGE_PLATFORM):
-        self.image_store_dir = Path(image_store_dir)
-        self.platform = platform
-        self.images: dict[str, dict[str, Any]] = {}
-        self.image_store_dir.mkdir(parents=True, exist_ok=True)
-        self.load_images()
-
-    def image_name(self, image_spec) -> str:
-        return image_spec.image or image_spec.user_specified_image or image_spec.image_ref
-
-    def normalize_image_ref(self, image: str) -> str:
-        return normalize_image_ref(image.removeprefix("docker://"))
-
-    def image_dir_name(self, image_ref: str) -> str:
-        return image_dir_name(image_ref)
-
-    def image_path(self, image_ref: str) -> Path:
-        return self.image_store_dir / self.image_dir_name(image_ref)
-
-    def metadata_path(self, image_path: Path) -> Path:
-        return image_path / IMAGE_METADATA_FILE
-
-    def path_size(self, path: Path) -> int:
-        return path_size(path)
-
-    def path_inodes(self, path: Path) -> int:
-        return sum(1 for _ in path.rglob("*"))
-
-    def read_metadata(self, image_path: Path) -> dict[str, Any] | None:
-        return read_image_metadata(image_path)
-
-    def write_metadata(self, img: dict[str, Any]) -> None:
-        write_image_metadata(img)
-
-    def normalize_repo_tags(self, img: dict[str, Any]) -> list[str]:
-        repo_tags = img.get("repo_tags") or []
-        if repo_tags:
-            canonical = [tag for tag in repo_tags if isinstance(tag, str) and tag]
-            if canonical:
-                return [canonical[0]]
-        image_id = img.get("image_id") or img.get("id") or "local:latest"
-        return [str(image_id)]
-
-    def load_images(self) -> None:
-        for image_path in self.image_store_dir.iterdir():
-            if not image_path.is_dir():
-                continue
-            img = self.read_metadata(image_path)
-            if img is None or not img.get("layer_digests"):
-                image_ref = (img or {}).get("id") or infer_image_ref_from_dir_name(image_path.name)
-                legacy_entries = [
-                    item
-                    for item in image_path.iterdir()
-                    if item.name not in {"blobs", IMAGE_METADATA_FILE}
-                ]
-                if legacy_entries:
-                    img = migrate_legacy_rootfs_image(image_path, str(image_ref))
-                else:
-                    continue
-            img["path"] = str(image_path)
-            img["size"] = self.path_size(image_path)
-            img["repo_tags"] = self.normalize_repo_tags(img)
-            self.register_image(img)
-
-    def register_image(self, img: dict[str, Any]) -> None:
-        self.images[img["id"]] = img
-        for tag in img["repo_tags"]:
-            self.images[tag] = img
-        self.images.setdefault(img["id"], img)
-
-    def unique_images(self) -> list[dict[str, Any]]:
-        seen = set()
-        result = []
-        for img in self.images.values():
-            if img["id"] in seen:
-                continue
-            seen.add(img["id"])
-            result.append(img)
-        return result
-
-    def find_image(self, image: str) -> dict[str, Any] | None:
-        if not image:
-            return None
-        img = self.images.get(image)
-        if img is not None:
-            return img
-        return self.images.get(self.normalize_image_ref(image))
-
-    def image_response(self, img: dict[str, Any]) -> Any:
-        repo_tags = list(img.get("repo_tags") or [])
-        if not repo_tags:
-            repo_tags = [img.get("id") or "local:latest"]
-        primary_tag = repo_tags[0]
-        image_id = img.get("image_id") or img.get("id") or primary_tag
-        if not str(image_id).startswith("sha256:"):
-            digest = hashlib.sha256(primary_tag.encode("utf-8")).hexdigest()
-            image_id = f"sha256:{digest[:64]}"
-        return api_pb2.Image(
-            id=image_id,
-            repo_tags=repo_tags,
-            size=img["size"],
-            spec=api_pb2.ImageSpec(image=primary_tag),
-        )
-
-    def matches_filter(self, img: dict[str, Any], filter_obj) -> bool:
-        if filter_obj is None:
-            return True
-        filter_image = self.image_name(filter_obj.image)
-        if not filter_image:
-            return True
-        filter_ref = self.normalize_image_ref(filter_image)
-        return filter_image in img["repo_tags"] or filter_ref in img["repo_tags"] or img["id"] == filter_ref
-
-    @log_rpc
-    async def ListImages(self, request, context):
-        images = [self.image_response(img) for img in self.unique_images() if self.matches_filter(img, request.filter)]
-        return api_pb2.ListImagesResponse(images=images)
-
-    async def StreamImages(self, request, context):
-        list_response = await self.ListImages(api_pb2.ListImagesRequest(filter=request.filter), context)
-        yield api_pb2.StreamImagesResponse(images=list_response.images)
-
-    @log_rpc
-    async def ImageStatus(self, request, context):
-        image = self.image_name(request.image)
-        img = self.find_image(image)
-        if img is None:
-            return api_pb2.ImageStatusResponse()
-        return api_pb2.ImageStatusResponse(image=self.image_response(img))
-
-    @log_rpc
-    async def PullImage(self, request, context):
-        image = self.image_name(request.image)
-        if not image:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "image is required")
-
-        image_ref = self.normalize_image_ref(image.removeprefix("docker://"))
-        try:
-            img = pull_image_to_store(image=image, image_store_dir=self.image_store_dir, platform=self.platform)
-        except Exception as exc:
-            logger.exception("PullImage failed for %s", image)
-            await context.abort(grpc.StatusCode.UNKNOWN, f"pull image failed: {exc}")
-
-        repo_tags = [image_ref]
-        img["repo_tags"] = repo_tags
-        self.write_metadata(img)
-        self.register_image(img)
-        return api_pb2.PullImageResponse(image_ref=image_ref)
-
-    @log_rpc
-    async def RemoveImage(self, request, context):
-        image = self.image_name(request.image)
-        img = self.find_image(image)
-        if img is None:
-            return api_pb2.RemoveImageResponse()
-        image_path = Path(img["path"])
-        if image_path.exists():
-            shutil.rmtree(image_path, ignore_errors=True)
-        for key, value in list(self.images.items()):
-            if value["id"] == img["id"]:
-                self.images.pop(key, None)
-        return api_pb2.RemoveImageResponse()
-
-    @log_rpc
-    async def ImageFsInfo(self, request, context):
-        return api_pb2.ImageFsInfoResponse(image_filesystems=[api_pb2.FilesystemUsage(used_bytes=api_pb2.UInt64Value(value=self.path_size(self.image_store_dir)))])
+    return items[full_id]
 
 
 class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
@@ -1820,7 +320,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "args": list(container.get("args") or []),
             "working_dir": container.get("working_dir") or "",
             "log_path": container.get("log_path") or f"{container['id']}.log",
-            "envs": dict(container.get("envs") or {}),
+            "envs": normalize_envs(container.get("envs")),
             "state": int(container.get("state", api_pb2.CONTAINER_CREATED)),
             "created_at": int(container.get("created_at", 0)),
             "started_at": int(container.get("started_at", 0)),
@@ -1862,7 +362,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "args": list(data.get("args") or []),
             "working_dir": data.get("working_dir") or None,
             "log_path": data.get("log_path") or f"{container_id}.log",
-            "envs": dict(data.get("envs") or {}),
+            "envs": normalize_envs(data.get("envs")),
             "state": state,
             "created_at": int(data.get("created_at", 0)),
             "started_at": int(data.get("started_at", 0)),
@@ -1944,36 +444,16 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             os.replace(tmp_path, state_path)
 
     def find_sandbox(self, sandbox_id: str) -> dict[str, Any] | None:
-        if sandbox_id in self.sandboxes:
-            return self.sandboxes[sandbox_id]
-        matches = [sb for full_id, sb in self.sandboxes.items() if full_id.startswith(sandbox_id)]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+        return find_unique_prefix_value(self.sandboxes, sandbox_id)
 
     def find_sandbox_id(self, sandbox_id: str) -> str | None:
-        if sandbox_id in self.sandboxes:
-            return sandbox_id
-        matches = [full_id for full_id in self.sandboxes.keys() if full_id.startswith(sandbox_id)]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+        return find_unique_prefix_key(self.sandboxes, sandbox_id)
 
     def find_container(self, container_id: str) -> dict[str, Any] | None:
-        if container_id in self.containers:
-            return self.containers[container_id]
-        matches = [c for full_id, c in self.containers.items() if full_id.startswith(container_id)]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+        return find_unique_prefix_value(self.containers, container_id)
 
     def find_container_id(self, container_id: str) -> str | None:
-        if container_id in self.containers:
-            return container_id
-        matches = [full_id for full_id in self.containers.keys() if full_id.startswith(container_id)]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+        return find_unique_prefix_key(self.containers, container_id)
 
     def image_path(self, image_ref: str) -> Path:
         return self.image_store_dir / self._image_dir_name(image_ref)
@@ -1984,7 +464,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
 
     def image_cache_needs_refresh(self, image_ref: str, image_name: str | None = None) -> bool:
         image = image_name or image_ref
-        if not image or is_local_image_reference(image) or local_image_source_exists(image):
+        if not image:
             return False
         img = read_image_metadata(self.image_path(image_ref)) or {}
         return img.get("source_type") != "registry"
@@ -2001,17 +481,8 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
                 return image_path
         if self.image_available(image_ref):
             return image_path
-        if image_path.exists():
-            img = read_image_metadata(image_path)
-            image_ref_for_migration = (img or {}).get("id") or image_ref
-            legacy_entries = [
-                item
-                for item in image_path.iterdir()
-                if item.name not in {"blobs", IMAGE_METADATA_FILE}
-            ]
-            if legacy_entries:
-                migrate_legacy_rootfs_image(image_path, str(image_ref_for_migration))
-                return image_path
+        if image_path.exists() and not self.image_available(image_ref):
+            shutil.rmtree(image_path, ignore_errors=True)
         source = image_name or image_ref
         pull_image_to_store(source, image_store_dir=self.image_store_dir, platform=self.image_platform)
         return image_path if self.image_available(image_ref) else None
@@ -2209,7 +680,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "TERM": os.environ.get("TERM", "xterm-256color"),
         }
-        env.update(container["envs"])
+        env.update(normalize_envs(container.get("envs")))
         return env
 
     def container_cwd(self, container: dict[str, Any]) -> str:
@@ -2583,7 +1054,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             )
         )
 
-    @log_rpc
+    @log_rpc(request_log=False)
     async def ListPodSandbox(self, request, context):
         items = []
         filter_obj = request.filter
@@ -2630,7 +1101,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "args": list(config.args) if config.args else [],
             "working_dir": config.working_dir or None,
             "log_path": f"{container_id}.log",
-            "envs": {env.key: env.value for env in config.envs} if config.envs else {},
+            "envs": normalize_envs(config.envs),
             "state": api_pb2.CONTAINER_CREATED,
             "created_at": int(time.time() * 1_000_000_000),
             "started_at": 0,
@@ -2706,7 +1177,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         self.save_runtime_state()
         return api_pb2.RemoveContainerResponse()
 
-    @log_rpc
+    @log_rpc(request_log=False)
     async def ListContainers(self, request, context):
         items = []
         filter_obj = request.filter
