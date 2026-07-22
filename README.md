@@ -24,6 +24,20 @@ privileged-демона и использует `ptrace` для виртуали
   `ptrace_syscalls.py` как subprocess-обертки.
 - Виртуальная сеть через `virtual_network.py` и `netservice`.
 
+## Реализованные CRI вызовы
+
+Сейчас реализованы и проверены следующие CRI вызовы:
+
+- `RunPodSandbox`
+- `PullImage`
+- `CreateContainer`
+- `StartContainer`
+- `ContainerStatus`
+- `StopContainer`
+- `RemoveContainer`
+- `StopPodSandbox`
+- `RemovePodSandbox`
+
 ## Структура
 
 ```text
