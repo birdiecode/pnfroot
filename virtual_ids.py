@@ -100,6 +100,16 @@ class VirtualIds:
         "setfsgid",
         "setgroups",
     }
+    RESULT_SYSCALLS = {
+        "getuid",
+        "geteuid",
+        "getgid",
+        "getegid",
+        "execve",
+        "execveat",
+    }
+    ENTRY_SYSCALLS = SETTER_SYSCALLS | POINTER_GETTER_SYSCALLS | CHOWN_SYSCALLS
+    EXIT_SYSCALLS = RESULT_SYSCALLS | ENTRY_SYSCALLS
 
     def __init__(self, uid: int, gid: int):
         self.initial = VirtualCredentials.from_ids(uid, gid)
@@ -132,12 +142,7 @@ class VirtualIds:
     def neutralize_syscall(
         self, pid: int, name: str, regs: UserRegsStruct
     ) -> dict[str, object]:
-        if (
-            name
-            not in self.SETTER_SYSCALLS
-            | self.POINTER_GETTER_SYSCALLS
-            | self.CHOWN_SYSCALLS
-        ):
+        if name not in self.ENTRY_SYSCALLS:
             return {}
 
         regs.orig_rax = self.noop_syscall_number
@@ -151,6 +156,9 @@ class VirtualIds:
             return
 
         name = record.name
+        if name not in self.EXIT_SYSCALLS:
+            return
+
         if name == "getuid":
             set_syscall_result(context, self.credentials(context.pid).ruid)
         elif name == "geteuid":

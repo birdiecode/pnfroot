@@ -47,6 +47,7 @@ MAX_JSON_MESSAGE_SIZE = 1024 * 1024
 MAX_SOCKADDR_SIZE = 128
 MAX_IOVEC_COUNT = 64
 MAX_NETLINK_REQUEST_SIZE = 1024 * 1024
+IFNAMSIZ = 16
 
 NLMSG_HDRLEN = 16
 NLMSG_DONE = 3
@@ -87,6 +88,8 @@ IFA_LABEL = 3
 IFA_BROADCAST = 4
 IFA_FLAGS = 8
 IFA_F_PERMANENT = 0x80
+
+SIOCGIFTXQLEN = 0x8942
 
 
 class NetworkServiceError(RuntimeError):
@@ -388,15 +391,56 @@ class NetworkServiceClient:
                         interface.apply_service_update(update)
         return response
 
-    def unregister_container(self, container_id: str) -> None:
+    def allocate_container(self, config: ContainerNetworkConfig) -> dict[str, object]:
+        response = self.request(
+            {
+                "version": 1,
+                "type": "allocate_container",
+                "container_id": config.container_id,
+                "interfaces": [
+                    interface.to_message()
+                    for interface in config.interfaces
+                ],
+            }
+        )
+        if not response.get("success", False):
+            error = response.get("error") or response.get("reason")
+            raise NetworkServiceError(str(error or "network allocation failed"))
+
+        interfaces = response.get("interfaces")
+        if isinstance(interfaces, list):
+            for update in interfaces:
+                if not isinstance(update, dict):
+                    continue
+                name = update.get("name")
+                network = update.get("network")
+                for interface in config.interfaces:
+                    if interface.name == name and interface.network == network:
+                        interface.apply_service_update(update)
+        return response
+
+    def release_container(self, container_id: str) -> None:
         try:
             self.request(
                 {
                     "version": 1,
-                    "type": "unregister_container",
+                    "type": "release_container",
                     "container_id": container_id,
                 }
             )
+        except NetworkServiceError:
+            pass
+
+    def unregister_container(self, container_id: str, pid: int | None = None) -> None:
+        message: dict[str, object] = {
+            "version": 1,
+            "type": "unregister_container",
+            "container_id": container_id,
+        }
+        if pid is not None:
+            message["pid"] = pid
+        try:
+            self.request(message)
         except NetworkServiceError:
             pass
 
@@ -465,6 +509,31 @@ class NetworkServiceClient:
 
 
 class VirtualNetworkRuntime:
+    ENTRY_SYSCALLS = {
+        "socket",
+        "connect",
+        "bind",
+        "sendmsg",
+        "sendto",
+        "write",
+        "recvmsg",
+        "ioctl",
+    }
+    EXIT_SYSCALLS = {
+        "socket",
+        "connect",
+        "bind",
+        "getsockname",
+        "getpeername",
+        "close",
+        "dup",
+        "dup2",
+        "dup3",
+        "close_range",
+        "accept",
+        "accept4",
+    }
+
     def __init__(self, config: ContainerNetworkConfig):
         self.config = config
         self.sockets = SocketTable()
@@ -482,7 +551,7 @@ class VirtualNetworkRuntime:
 
     def unregister_container(self) -> None:
         if self.client is not None and self.registered:
-            self.client.unregister_container(self.config.container_id)
+            self.client.unregister_container(self.config.container_id, self.initial_pid)
         if self.client is not None:
             self.client.close()
         self.client = None
@@ -500,6 +569,9 @@ class VirtualNetworkRuntime:
     def rewrite_syscall_entry(
         self, pid: int, name: str, args: list[int], regs: UserRegsStruct
     ) -> dict[str, object]:
+        if name not in self.ENTRY_SYSCALLS:
+            return {}
+
         if name == "socket":
             return {
                 "network_socket_family": signed64(args[0]),
@@ -516,8 +588,12 @@ class VirtualNetworkRuntime:
             return self.prepare_sendmsg(pid, args, regs)
         if name == "sendto":
             return self.prepare_sendto(pid, args, regs)
+        if name == "write":
+            return self.prepare_write(pid, args, regs)
         if name == "recvmsg":
             return self.prepare_recvmsg(pid, args, regs)
+        if name == "ioctl":
+            return self.prepare_ioctl(pid, args, regs)
         return {}
 
     def handle_syscall_exit(
@@ -536,6 +612,8 @@ class VirtualNetworkRuntime:
     ) -> None:
         if "network_forced_result" in record.metadata:
             set_syscall_result(context, int(record.metadata["network_forced_result"]))
+            return
+        if record.name not in self.EXIT_SYSCALLS:
             return
         if record.name == "socket":
             self.handle_socket_exit(context, record)
@@ -756,6 +834,31 @@ class VirtualNetworkRuntime:
         )
         return self.neutralize_syscall_result(pid, regs, length)
 
+    def prepare_write(
+        self, pid: int, args: list[int], regs: UserRegsStruct
+    ) -> dict[str, object]:
+        fd = signed64(args[0])
+        tracked = self.sockets.get(pid, fd)
+        if tracked is None or not tracked.is_route_netlink:
+            return {}
+
+        length = signed64(args[2])
+        if length < 0 or length > MAX_NETLINK_REQUEST_SIZE:
+            return self.neutralize_syscall_result(pid, regs, -errno.EMSGSIZE)
+        try:
+            payload = read_tracee_bytes(pid, args[1], length)
+        except OSError:
+            return self.neutralize_syscall_result(pid, regs, -errno.EFAULT)
+
+        tracked.netlink_queue.extend(
+            build_rtnetlink_datagrams(
+                payload,
+                self.config,
+                port_id=tracked.netlink_port_id or pid,
+            )
+        )
+        return self.neutralize_syscall_result(pid, regs, length)
+
     def prepare_recvmsg(
         self, pid: int, args: list[int], regs: UserRegsStruct
     ) -> dict[str, object]:
@@ -797,6 +900,37 @@ class VirtualNetworkRuntime:
 
         result = len(message) if flags & MSG_TRUNC else written
         return self.neutralize_syscall_result(pid, regs, result)
+
+    def prepare_ioctl(
+        self, pid: int, args: list[int], regs: UserRegsStruct
+    ) -> dict[str, object]:
+        request = signed64(args[1])
+        if request != SIOCGIFTXQLEN:
+            return {}
+
+        if not self.is_virtual_interface_ifreq(pid, args[2]):
+            return {}
+
+        try:
+            write_tracee_u32(pid, args[2] + IFNAMSIZ, 1000)
+        except OSError:
+            return self.neutralize_syscall_result(pid, regs, -errno.EFAULT)
+        return self.neutralize_syscall_result(pid, regs, 0)
+
+    def is_virtual_interface_ifreq(self, pid: int, address: int) -> bool:
+        if address == 0:
+            return False
+        try:
+            raw_name = read_tracee_bytes(pid, address, IFNAMSIZ)
+        except OSError:
+            return False
+        interface_name = raw_name.split(b"\x00", 1)[0].decode(
+            "ascii",
+            errors="ignore",
+        )
+        if interface_name == "lo":
+            return True
+        return any(interface.name == interface_name for interface in self.config.interfaces)
 
     def prepare_bind(
         self, pid: int, args: list[int], regs: UserRegsStruct

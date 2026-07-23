@@ -99,6 +99,17 @@ python pnfroot.py \
   --container-store-dir /tmp/pnfroot/containers
 ```
 
+С pod-сетью через `network_service`:
+
+```bash
+python pnfroot.py \
+  --socket-path /tmp/pnfroot.sock \
+  --image-store-dir /tmp/pnfroot/images \
+  --container-store-dir /tmp/pnfroot/containers \
+  --netservice-socket /tmp/net.unix \
+  --pod-network podnet
+```
+
 Streaming-сервер для `Exec` по умолчанию слушает `127.0.0.1` на случайном порту
 и возвращает CRI URL вида:
 
@@ -155,15 +166,21 @@ CRI `PullImage` не принимает локальный rootfs-каталог
 ```bash
 python3 -m netservice.server \
   --socket /tmp/net.unix \
-  --internet-networks testnet \
+  --network podnet=10.42.0.0/24 \
+  --internet-networks podnet \
   --log
 ```
+
+`--network` задает имя сети и CIDR, из которого `network_service` раздает Pod IP.
+Контейнеры внутри одного Pod используют общий virtual loopback, поэтому могут
+ходить друг к другу через `127.0.0.1`. Разные Pod в одной сети могут обращаться
+друг к другу напрямую по Pod IP без NAT.
 
 Затем traced-процесс можно запустить с виртуальным интерфейсом:
 
 ```bash
 ./ptrace_syscalls.py \
-  --netdev name=eth0,network=backend \
+  --netdev name=eth0,network=podnet \
   --netservice /tmp/net.unix \
   -- /bin/bash
 ```

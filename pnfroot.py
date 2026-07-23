@@ -54,6 +54,12 @@ from image_store import (
 )
 from image_service import ImageService
 import ptrace_syscalls
+from virtual_network import (
+    ContainerNetworkConfig,
+    NetworkServiceClient,
+    NetworkServiceError,
+    VirtualNetworkInterface,
+)
 # Compatibility re-exports for CRI streaming constants/classes.
 from streaming import (
     CHANNEL_PROTOCOLS,
@@ -98,6 +104,11 @@ IMAGE_STORE_DIR = "/tmp/pnfroot/images"
 CONTAINER_STORE_DIR = "/tmp/pnfroot/containers"
 ROOTFS_METADATA_FILE = "pnfroot-rootfs.json"
 RUNTIME_STATE_FILE = "pnfroot-runtime-state.json"
+RECOVERED_CONTAINER_EXIT_CODE = 255
+RECOVERED_CONTAINER_REASON = "ContainerStatusUnknown"
+RECOVERED_CONTAINER_MESSAGE = (
+    "container was running before pnfroot restart and cannot be reattached"
+)
 
 
 def pipe_to_cri_log(pipe, log_path: str, stream: str) -> None:
@@ -138,6 +149,12 @@ def normalize_envs(envs: Any) -> dict[str, str]:
         items = ((env.key, env.value) for env in envs)
 
     return {env_text(key): env_text(value) for key, value in items}
+
+
+def int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
 
 
 def process_status_to_returncode(status: int) -> int:
@@ -245,10 +262,16 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         stream_host: str = STREAM_HOST,
         stream_port: int = STREAM_PORT,
         stream_public_host: str | None = None,
+        netservice_socket: str | None = None,
+        pod_network_name: str | None = None,
+        pod_network_interface: str = "eth0",
     ):
         self.image_store_dir = Path(image_store_dir)
         self.container_store_dir = Path(container_store_dir)
         self.image_platform = image_platform
+        self.netservice_socket = os.path.abspath(netservice_socket) if netservice_socket else None
+        self.pod_network_name = pod_network_name
+        self.pod_network_interface = pod_network_interface
         self.image_store_dir.mkdir(parents=True, exist_ok=True)
         self.container_store_dir.mkdir(parents=True, exist_ok=True)
         self.sandboxes: dict[str, dict[str, Any]] = {}
@@ -280,6 +303,191 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
     def runtime_state_path(self) -> Path:
         return self.container_store_dir / RUNTIME_STATE_FILE
 
+    def pod_networking_enabled(self) -> bool:
+        return bool(self.netservice_socket and self.pod_network_name)
+
+    def allocate_pod_network(self, pod_id: str) -> dict[str, Any]:
+        if not self.pod_networking_enabled():
+            return {}
+
+        interface = VirtualNetworkInterface(
+            name=self.pod_network_interface,
+            network=self.pod_network_name or "",
+        )
+        config = ContainerNetworkConfig(
+            container_id=pod_id,
+            interfaces=[interface],
+            service_socket=self.netservice_socket or "",
+        )
+        client = NetworkServiceClient(config.service_socket)
+        try:
+            client.allocate_container(config)
+        finally:
+            client.close()
+
+        return self.network_state_from_interface(pod_id, interface, config.service_socket)
+
+    def release_pod_network(self, sandbox: dict[str, Any]) -> None:
+        network = sandbox.get("network") or {}
+        service_socket = network.get("service_socket")
+        container_id = network.get("container_id") or sandbox.get("id")
+        if not service_socket or not container_id:
+            return
+
+        client = NetworkServiceClient(str(service_socket))
+        try:
+            client.release_container(str(container_id))
+        finally:
+            client.close()
+
+    def network_state_from_interface(
+        self,
+        pod_id: str,
+        interface: VirtualNetworkInterface,
+        service_socket: str,
+    ) -> dict[str, Any]:
+        return {
+            "container_id": pod_id,
+            "service_socket": service_socket,
+            "interface": interface.name,
+            "network": interface.network,
+            "ip": interface.ip_address or "",
+            "prefix_length": interface.prefix_length or 0,
+            "gateway": interface.gateway or "",
+            "mac": interface.mac_address or "",
+            "mtu": interface.mtu,
+            "dns": list(interface.dns_servers),
+        }
+
+    def linux_security_context(self, config: Any) -> Any | None:
+        if config is None:
+            return None
+        try:
+            if not config.HasField("linux"):
+                return None
+            linux = config.linux
+            if not linux.HasField("security_context"):
+                return None
+            return linux.security_context
+        except (AttributeError, ValueError):
+            return None
+
+    def identity_from_security_contexts(
+        self,
+        *contexts: Any | None,
+    ) -> dict[str, Any]:
+        uid: int | None = None
+        gid: int | None = None
+        run_as_username = ""
+        supplemental_groups: list[int] = []
+
+        for security_context in contexts:
+            if security_context is None:
+                continue
+            if uid is None and security_context.HasField("run_as_user"):
+                uid = int(security_context.run_as_user.value)
+            if gid is None and security_context.HasField("run_as_group"):
+                gid = int(security_context.run_as_group.value)
+            if not run_as_username and getattr(security_context, "run_as_username", ""):
+                run_as_username = str(security_context.run_as_username)
+            if not supplemental_groups:
+                supplemental_groups = [
+                    int(group)
+                    for group in getattr(security_context, "supplemental_groups", [])
+                ]
+
+        if uid is not None and gid is None:
+            gid = uid
+
+        return {
+            "uid": uid,
+            "gid": gid,
+            "run_as_username": run_as_username,
+            "supplemental_groups": supplemental_groups,
+        }
+
+    def container_identity_from_config(
+        self,
+        container_config: Any,
+        sandbox_config: Any | None,
+    ) -> dict[str, Any]:
+        return self.identity_from_security_contexts(
+            self.linux_security_context(container_config),
+            self.linux_security_context(sandbox_config),
+        )
+
+    def container_user_ids(self, container: dict[str, Any]) -> tuple[int, int] | None:
+        uid = int_or_none(container.get("uid"))
+        gid = int_or_none(container.get("gid"))
+        if uid is not None and gid is None:
+            gid = uid
+        elif uid is None and gid is not None:
+            uid = os.getuid()
+        if uid is None or gid is None:
+            return None
+        return uid, gid
+
+    def container_user_status(self, container: dict[str, Any]) -> api_pb2.ContainerUser:
+        user = api_pb2.ContainerUser()
+        user_ids = self.container_user_ids(container)
+        if user_ids is None:
+            return user
+        uid, gid = user_ids
+        user.linux.uid = uid
+        user.linux.gid = gid
+        user.linux.supplemental_groups.extend(
+            int(group)
+            for group in container.get("supplemental_groups", []) or []
+        )
+        return user
+
+    def container_status_reason_message(
+        self,
+        container: dict[str, Any],
+    ) -> tuple[str, str]:
+        reason = container.get("status_reason") or ""
+        message = container.get("status_message") or ""
+        if reason or message:
+            return reason, message
+
+        state = int(container.get("state", api_pb2.CONTAINER_CREATED))
+        if state == api_pb2.CONTAINER_RUNNING:
+            return "Running", ""
+        if state == api_pb2.CONTAINER_EXITED:
+            exit_code = int(container.get("exit_code", 0))
+            return ("Completed" if exit_code == 0 else "Error"), ""
+        return "Created", ""
+
+    def container_network_config(
+        self, container: dict[str, Any]
+    ) -> ContainerNetworkConfig | None:
+        sandbox = self.sandboxes.get(container.get("pod_sandbox_id") or "")
+        if sandbox is None:
+            return None
+        network = sandbox.get("network") or {}
+        service_socket = network.get("service_socket")
+        network_name = network.get("network")
+        interface_name = network.get("interface")
+        ip_address = network.get("ip")
+        if not service_socket or not network_name or not interface_name or not ip_address:
+            return None
+
+        interface = VirtualNetworkInterface(
+            name=str(interface_name),
+            network=str(network_name),
+            ip_address=str(ip_address),
+            prefix_length=int(network.get("prefix_length") or 0) or None,
+            gateway=str(network.get("gateway") or "") or None,
+            mac_address=str(network.get("mac") or "") or None,
+            mtu=int(network.get("mtu") or 1500),
+            dns_servers=list(network.get("dns") or []),
+        )
+        return ContainerNetworkConfig(
+            container_id=str(network.get("container_id") or sandbox["id"]),
+            interfaces=[interface],
+            service_socket=str(service_socket),
+        )
+
     def sandbox_to_state(self, sandbox: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": sandbox["id"],
@@ -289,6 +497,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "labels": dict(sandbox.get("labels") or {}),
             "annotations": dict(sandbox.get("annotations") or {}),
             "runtime_handler": sandbox.get("runtime_handler") or "",
+            "network": dict(sandbox.get("network") or {}),
         }
 
     def sandbox_from_state(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -301,6 +510,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "labels": dict(data.get("labels") or {}),
             "annotations": dict(data.get("annotations") or {}),
             "runtime_handler": data.get("runtime_handler") or "",
+            "network": dict(data.get("network") or {}),
         }
 
     def container_to_state(self, container: dict[str, Any]) -> dict[str, Any]:
@@ -321,11 +531,20 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "working_dir": container.get("working_dir") or "",
             "log_path": container.get("log_path") or f"{container['id']}.log",
             "envs": normalize_envs(container.get("envs")),
+            "uid": container.get("uid"),
+            "gid": container.get("gid"),
+            "run_as_username": container.get("run_as_username") or "",
+            "supplemental_groups": [
+                int(group)
+                for group in container.get("supplemental_groups", []) or []
+            ],
             "state": int(container.get("state", api_pb2.CONTAINER_CREATED)),
             "created_at": int(container.get("created_at", 0)),
             "started_at": int(container.get("started_at", 0)),
             "finished_at": int(container.get("finished_at", 0)),
             "exit_code": int(container.get("exit_code", 0)),
+            "status_reason": container.get("status_reason") or "",
+            "status_message": container.get("status_message") or "",
             "labels": dict(container.get("labels") or {}),
             "annotations": dict(container.get("annotations") or {}),
             "image_id": container.get("image_id") or "",
@@ -346,7 +565,13 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         if state == api_pb2.CONTAINER_RUNNING:
             state = api_pb2.CONTAINER_EXITED
             finished_at = finished_at or time.time_ns()
+            exit_code = exit_code or RECOVERED_CONTAINER_EXIT_CODE
             start_status = "recovered"
+            status_reason = RECOVERED_CONTAINER_REASON
+            status_message = RECOVERED_CONTAINER_MESSAGE
+        else:
+            status_reason = data.get("status_reason") or ""
+            status_message = data.get("status_message") or ""
         rootfs_status = data.get("rootfs_status") or None
         if rootfs_status == "preparing":
             rootfs_status = None
@@ -363,11 +588,20 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "working_dir": data.get("working_dir") or None,
             "log_path": data.get("log_path") or f"{container_id}.log",
             "envs": normalize_envs(data.get("envs")),
+            "uid": int_or_none(data.get("uid")),
+            "gid": int_or_none(data.get("gid")),
+            "run_as_username": data.get("run_as_username") or "",
+            "supplemental_groups": [
+                int(group)
+                for group in data.get("supplemental_groups", []) or []
+            ],
             "state": state,
             "created_at": int(data.get("created_at", 0)),
             "started_at": int(data.get("started_at", 0)),
             "finished_at": finished_at,
             "exit_code": exit_code,
+            "status_reason": status_reason,
+            "status_message": status_message,
             "labels": dict(data.get("labels") or {}),
             "annotations": dict(data.get("annotations") or {}),
             "image_id": data.get("image_id") or data.get("image_ref") or "",
@@ -678,7 +912,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         env = {
             "HOME": "/root",
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "TERM": os.environ.get("TERM", "xterm-256color"),
+            "TERM": "xterm-256color",
         }
         env.update(normalize_envs(container.get("envs")))
         return env
@@ -715,7 +949,9 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         stderr: bool = False,
     ) -> tuple[subprocess.Popen[bytes] | ContainerizedProcess, int | None]:
         rootfs = self.wait_for_container_rootfs(container)
-        if rootfs is None:
+        network_config = self.container_network_config(container)
+        user_ids = self.container_user_ids(container)
+        if rootfs is None and network_config is None and user_ids is None:
             return self.start_host_process(
                 container,
                 command,
@@ -728,6 +964,8 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             container,
             command,
             rootfs=rootfs,
+            network_config=network_config,
+            user_ids=user_ids,
             tty=tty,
             stdin=stdin,
             stdout=stdout,
@@ -783,7 +1021,9 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         container: dict[str, Any],
         command: list[str],
         *,
-        rootfs: Path,
+        rootfs: Path | None,
+        network_config: ContainerNetworkConfig | None,
+        user_ids: tuple[int, int] | None,
         tty: bool,
         stdin: bool,
         stdout: bool,
@@ -825,17 +1065,22 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
                 supervisor_pid = os.fork()
             if supervisor_pid == 0:
                 try:
+                    uid = user_ids[0] if user_ids is not None else None
+                    gid = user_ids[1] if user_ids is not None else None
                     os.setsid()
                     self.close_fds(stdin_write, stdout_read, stderr_read, pty_master)
                     exit_code = ptrace_syscalls.run_tracee(
                         command,
-                        rootfs_path=str(rootfs),
+                        rootfs_path=str(rootfs) if rootfs is not None else None,
                         cwd=self.container_virtual_cwd(container),
                         env=self.container_env(container),
                         stdin_fd=child_stdin,
                         stdout_fd=child_stdout,
                         stderr_fd=child_stderr,
                         controlling_tty=tty,
+                        uid=uid,
+                        gid=gid,
+                        network_config=network_config,
                     )
                     os._exit(exit_code)
                 except BaseException as exc:
@@ -918,6 +1163,8 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             container["stop_requested"] = False
             container["start_status"] = "starting"
             container["start_error"] = ""
+            container["status_reason"] = ""
+            container["status_message"] = ""
             thread = threading.Thread(
                 target=self._start_container_process,
                 args=(container,),
@@ -973,6 +1220,8 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
                 container["state"] = api_pb2.CONTAINER_EXITED
                 container["finished_at"] = container["finished_at"] or int(time.time() * 1_000_000_000)
                 container["exit_code"] = 125
+                container["status_reason"] = "StartError"
+                container["status_message"] = str(exc)
                 condition.notify_all()
             self.save_runtime_state()
 
@@ -998,6 +1247,11 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
     @log_rpc
     async def RunPodSandbox(self, request, context):
         pod_id = uuid.uuid4().hex
+        try:
+            network = self.allocate_pod_network(pod_id)
+        except NetworkServiceError as exc:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+
         self.sandboxes[pod_id] = {
             "id": pod_id,
             "metadata": request.config.metadata,
@@ -1006,6 +1260,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "labels": request.config.labels,
             "annotations": request.config.annotations,
             "runtime_handler": request.runtime_handler,
+            "network": network,
         }
         self.save_runtime_state()
         return api_pb2.RunPodSandboxResponse(pod_sandbox_id=pod_id)
@@ -1032,7 +1287,12 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         full_id = self.find_sandbox_id(request.pod_sandbox_id)
         if full_id is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, "sandbox not found")
-        self.sandboxes.pop(full_id, None)
+        sandbox = self.sandboxes.pop(full_id, None)
+        if sandbox is not None:
+            try:
+                self.release_pod_network(sandbox)
+            except NetworkServiceError as exc:
+                logger.warning("Cannot release pod network for %s: %s", full_id, exc)
         self.save_runtime_state()
         return api_pb2.RemovePodSandboxResponse()
 
@@ -1041,13 +1301,15 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         sandbox = self.find_sandbox(request.pod_sandbox_id)
         if sandbox is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, "sandbox not found")
+        network = sandbox.get("network") or {}
+        pod_ip = str(network.get("ip") or "127.0.0.1")
         return api_pb2.PodSandboxStatusResponse(
             status=api_pb2.PodSandboxStatus(
                 id=sandbox["id"],
                 metadata=sandbox["metadata"],
                 state=sandbox["state"],
                 created_at=sandbox["created_at"],
-                network=api_pb2.PodSandboxNetworkStatus(ip="127.0.0.1"),
+                network=api_pb2.PodSandboxNetworkStatus(ip=pod_ip),
                 labels=sandbox["labels"],
                 annotations=sandbox["annotations"],
                 runtime_handler=sandbox["runtime_handler"],
@@ -1089,6 +1351,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         config = request.config
         image_name = config.image.image if config.image and config.image.image else ""
         image_ref = normalize_image_ref(image_name.removeprefix("docker://")) if image_name else ""
+        identity = self.container_identity_from_config(config, request.sandbox_config)
 
         bundle_path = self.container_store_dir / container_id
         container = {
@@ -1102,11 +1365,17 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "working_dir": config.working_dir or None,
             "log_path": f"{container_id}.log",
             "envs": normalize_envs(config.envs),
+            "uid": identity["uid"],
+            "gid": identity["gid"],
+            "run_as_username": identity["run_as_username"],
+            "supplemental_groups": identity["supplemental_groups"],
             "state": api_pb2.CONTAINER_CREATED,
             "created_at": int(time.time() * 1_000_000_000),
             "started_at": 0,
             "finished_at": 0,
             "exit_code": 0,
+            "status_reason": "",
+            "status_message": "",
             "labels": config.labels,
             "annotations": config.annotations,
             "image_id": image_ref,
@@ -1213,6 +1482,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         if container is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, "container not found")
         self.refresh_container_state(container)
+        reason, message = self.container_status_reason_message(container)
         status = api_pb2.ContainerStatus(
             id=container["id"],
             metadata=container["metadata"],
@@ -1223,12 +1493,13 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             exit_code=container["exit_code"],
             image=container["image"],
             image_ref=container["image_ref"],
-            reason="Running" if container["state"] == api_pb2.CONTAINER_RUNNING else "Created",
-            message="",
+            reason=reason,
+            message=message,
             labels=container["labels"],
             annotations=container["annotations"],
             image_id=container["image_id"],
             log_path=container["log_path"],
+            user=self.container_user_status(container),
         )
         return api_pb2.ContainerStatusResponse(status=status)
 
@@ -1318,8 +1589,26 @@ def parse_args() -> argparse.Namespace:
         "--stream-public-host",
         help="host name or address embedded into CRI Exec streaming URLs",
     )
+    parser.add_argument(
+        "--netservice-socket",
+        help="Unix socket path of the virtual network service used for pod networking",
+    )
+    parser.add_argument(
+        "--pod-network",
+        help="virtual network name assigned to all pod sandboxes",
+    )
+    parser.add_argument(
+        "--pod-network-interface",
+        default="eth0",
+        help="interface name exposed inside pods when pod networking is enabled",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if bool(args.netservice_socket) != bool(args.pod_network):
+        parser.error("--netservice-socket and --pod-network must be passed together")
+    if args.netservice_socket:
+        args.netservice_socket = os.path.abspath(args.netservice_socket)
+    return args
 
 
 async def main() -> None:
@@ -1337,6 +1626,9 @@ async def main() -> None:
         stream_host=args.stream_host,
         stream_port=args.stream_port,
         stream_public_host=args.stream_public_host,
+        netservice_socket=args.netservice_socket,
+        pod_network_name=args.pod_network,
+        pod_network_interface=args.pod_network_interface,
     )
     api_pb2_grpc.add_RuntimeServiceServicer_to_server(
         runtime_service,
@@ -1354,6 +1646,8 @@ async def main() -> None:
     logger.info("Container store dir: %s", args.container_store_dir)
     logger.info("Image platform: %s", args.image_platform)
     logger.info("Streaming server: %s:%s", args.stream_host, args.stream_port)
+    if args.netservice_socket:
+        logger.info("Pod network: %s via %s", args.pod_network, args.netservice_socket)
     try:
         await server.wait_for_termination()
     finally:

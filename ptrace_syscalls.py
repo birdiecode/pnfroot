@@ -127,6 +127,9 @@ def trace_log(message: str, *, file=sys.stdout) -> None:
 
 
 def dispatch_syscall_handlers(context: SyscallContext) -> None:
+    if not TRACE_LOGGING:
+        return
+
     handlers = SYSCALL_HANDLERS.get("*", []) + SYSCALL_HANDLERS.get(context.name, [])
 
     for when, handler in handlers:
@@ -211,18 +214,19 @@ def syscall_entry(pid: int) -> SyscallRecord:
     if VIRTUAL_NETWORK is not None:
         metadata.update(VIRTUAL_NETWORK.rewrite_syscall_entry(pid, name, args, regs))
 
-    rendered_args = format_syscall_args(pid, name, args)
-    dispatch_syscall_handlers(
-        SyscallContext(
-            pid=pid,
-            event="enter",
-            name=name,
-            number=number,
-            args=args,
-            regs=regs,
-            rendered_args=rendered_args,
+    rendered_args = format_syscall_args(pid, name, args) if TRACE_LOGGING else ""
+    if TRACE_LOGGING:
+        dispatch_syscall_handlers(
+            SyscallContext(
+                pid=pid,
+                event="enter",
+                name=name,
+                number=number,
+                args=args,
+                regs=regs,
+                rendered_args=rendered_args,
+            )
         )
-    )
     return SyscallRecord(
         name=name,
         number=number,
@@ -245,7 +249,7 @@ def syscall_exit(pid: int, record: SyscallRecord | None) -> None:
             int(regs.r8),
             int(regs.r9),
         ]
-        rendered_args = format_syscall_args(pid, name, args)
+        rendered_args = format_syscall_args(pid, name, args) if TRACE_LOGGING else ""
     else:
         number = record.number
         name = record.name
@@ -271,7 +275,8 @@ def syscall_exit(pid: int, record: SyscallRecord | None) -> None:
     if record is not None and "forced_result" in record.metadata:
         set_syscall_result(context, int(record.metadata["forced_result"]))
 
-    dispatch_syscall_handlers(context)
+    if TRACE_LOGGING:
+        dispatch_syscall_handlers(context)
 
 
 def resume_syscall(pid: int, sig: int = 0) -> None:

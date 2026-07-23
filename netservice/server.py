@@ -18,7 +18,12 @@ if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from netservice.protocol import ProtocolError, read_message, write_message
-from netservice.registry import PortMapping, RegistryError, VirtualNetworkRegistry
+from netservice.registry import (
+    NetworkDefinition,
+    PortMapping,
+    RegistryError,
+    VirtualNetworkRegistry,
+)
 from netservice.tcp_proxy import TcpForwarder, TcpProxyManager
 
 
@@ -62,11 +67,12 @@ class VirtualNetworkService:
         *,
         quiet: bool = True,
         internet_networks: set[str] | None = None,
+        networks: list[NetworkDefinition] | None = None,
     ) -> None:
         self.socket_path = socket_path
         self.quiet = quiet
         self.internet_networks = set(internet_networks or set())
-        self.registry = VirtualNetworkRegistry()
+        self.registry = VirtualNetworkRegistry(networks=networks)
         self.proxy_manager = TcpProxyManager()
         self.publish_rules: dict[str, list[PublishRule]] = {}
         self.active_publishes: dict[tuple[str, str, int, int, str], ActivePublish] = {}
@@ -147,6 +153,10 @@ class VirtualNetworkService:
     def handle_message(self, message: dict[str, object]) -> dict[str, object]:
         message_type = message.get("type")
         try:
+            if message_type == "allocate_container":
+                return self.handle_allocate_container(message)
+            if message_type == "release_container":
+                return self.handle_release_container(message)
             if message_type == "register_container":
                 return self.handle_register_container(message)
             if message_type == "unregister_container":
@@ -165,6 +175,42 @@ class VirtualNetworkService:
         self.log(f"unknown message type: {message_type}")
         return error_response(message, "EINVAL", f"unknown message type: {message_type}")
 
+    def handle_allocate_container(
+        self, message: dict[str, object]
+    ) -> dict[str, object]:
+        container_id = require_string(message, "container_id")
+        interfaces = message.get("interfaces")
+        if not isinstance(interfaces, list):
+            raise ValueError("interfaces must be a list")
+        records = self.registry.allocate_container(container_id, interfaces)
+        self.log(
+            "allocated "
+            + container_id
+            + " "
+            + ", ".join(f"{item.network}/{item.name}/{item.ip}" for item in records)
+        )
+        return {
+            "version": 1,
+            "type": "allocate_container_result",
+            "success": True,
+            "container_id": container_id,
+            "interfaces": [record.to_message() for record in records],
+        }
+
+    def handle_release_container(
+        self, message: dict[str, object]
+    ) -> dict[str, object]:
+        container_id = require_string(message, "container_id")
+        self.remove_published_ports(container_id)
+        self.registry.release_container(container_id)
+        self.log(f"released {container_id}")
+        return {
+            "version": 1,
+            "type": "release_container_result",
+            "success": True,
+            "container_id": container_id,
+        }
+
     def handle_register_container(
         self, message: dict[str, object]
     ) -> dict[str, object]:
@@ -177,10 +223,13 @@ class VirtualNetworkService:
             container_id,
             message.get("published_ports", []),
         )
-        self.remove_published_ports(container_id)
+        had_record = container_id in self.registry.containers
+        if publish_rules or not had_record:
+            self.remove_published_ports(container_id)
         records = self.registry.register_container(container_id, pid, interfaces)
         with self._publish_lock:
-            self.publish_rules[container_id] = publish_rules
+            if publish_rules or not had_record:
+                self.publish_rules[container_id] = publish_rules
         self.log(
             "registered "
             + container_id
@@ -210,8 +259,12 @@ class VirtualNetworkService:
         self, message: dict[str, object]
     ) -> dict[str, object]:
         container_id = require_string(message, "container_id")
-        self.remove_published_ports(container_id)
-        self.registry.unregister_container(container_id)
+        pid = optional_int(message, "pid")
+        if pid is not None:
+            self.remove_published_ports_for_pid(container_id, pid)
+        removed = self.registry.unregister_container(container_id, pid)
+        if removed:
+            self.remove_published_ports(container_id)
         self.log(f"unregistered {container_id}")
         return {
             "version": 1,
@@ -226,6 +279,7 @@ class VirtualNetworkService:
         container_id = require_string(message, "container_id")
         mapping = self.registry.bind_port(
             container_id=container_id,
+            pid=require_int(message, "pid"),
             interface_name=require_string(message, "interface"),
             network_name=require_string(message, "network"),
             virtual_ip=require_string(virtual_address, "ip"),
@@ -377,6 +431,15 @@ class VirtualNetworkService:
                 self.deactivate_published_port(key)
             self.publish_rules.pop(container_id, None)
 
+    def remove_published_ports_for_pid(self, container_id: str, pid: int) -> None:
+        with self._publish_lock:
+            for key in [
+                key
+                for key, active in self.active_publishes.items()
+                if active.mapping.container_id == container_id and active.mapping.pid == pid
+            ]:
+                self.deactivate_published_port(key)
+
     def stop_all_published_ports(self) -> None:
         with self._publish_lock:
             for key in list(self.active_publishes):
@@ -438,6 +501,10 @@ def error_response(
         response.update({"type": "connect_result", "action": "deny", "reason": reason})
     elif request_type == "bind_request":
         response.update({"type": "bind_result", "action": "deny", "reason": reason})
+    elif request_type == "allocate_container":
+        response.update({"type": "allocate_container_result"})
+    elif request_type == "release_container":
+        response.update({"type": "release_container_result"})
     elif request_type == "register_container":
         response.update({"type": "register_container_result"})
     else:
@@ -457,6 +524,11 @@ def require_int(data: dict[str, object], key: str) -> int:
     if not isinstance(value, int):
         raise ValueError(f"missing field: {key}")
     return value
+
+
+def optional_int(data: dict[str, object], key: str) -> int | None:
+    value = data.get(key)
+    return value if isinstance(value, int) else None
 
 
 def require_dict(data: dict[str, object], key: str) -> dict[str, object]:
@@ -520,6 +592,69 @@ def validate_publish_port(value: int, name: str) -> None:
         raise ValueError(f"{name} must be between 1 and 65535")
 
 
+def parse_network_definition(value: str) -> NetworkDefinition:
+    fields: dict[str, str] = {}
+    for index, item in enumerate(value.split(",")):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError(
+                f"invalid --network field {item!r}; expected key=value"
+            )
+        key, field_value = item.split("=", 1)
+        key = key.strip()
+        field_value = field_value.strip()
+        if not key or not field_value:
+            raise argparse.ArgumentTypeError(
+                f"invalid --network field {item!r}; expected key=value"
+            )
+        if index == 0 and key not in {"name", "subnet", "gateway"}:
+            fields["name"] = key
+            fields["subnet"] = field_value
+            continue
+        if key in fields:
+            raise argparse.ArgumentTypeError(f"duplicate --network field: {key}")
+        fields[key] = field_value
+
+    unknown = set(fields) - {"name", "subnet", "gateway"}
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            "unknown --network field(s): " + ", ".join(sorted(unknown))
+        )
+    for required in ("name", "subnet"):
+        if required not in fields:
+            raise argparse.ArgumentTypeError(f"--network requires field {required!r}")
+
+    try:
+        subnet = ipaddress.ip_network(fields["subnet"], strict=False)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --network subnet: {fields['subnet']}"
+        ) from exc
+    if not isinstance(subnet, ipaddress.IPv4Network):
+        raise argparse.ArgumentTypeError("--network currently supports only IPv4")
+
+    gateway = fields.get("gateway")
+    if gateway is not None:
+        try:
+            gateway_address = ipaddress.IPv4Address(gateway)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid --network gateway: {gateway}"
+            ) from exc
+        if gateway_address not in subnet:
+            raise argparse.ArgumentTypeError(
+                f"--network gateway is outside subnet: {gateway}"
+            )
+
+    return NetworkDefinition(
+        name=fields["name"],
+        subnet=subnet,
+        gateway=gateway,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Virtual network Unix-socket service.")
     parser.add_argument(
@@ -550,6 +685,17 @@ def parse_args() -> argparse.Namespace:
             "destinations through the host network"
         ),
     )
+    parser.add_argument(
+        "--network",
+        action="append",
+        default=[],
+        type=parse_network_definition,
+        metavar="NAME=CIDR[,gateway=IP]",
+        help=(
+            "predefine a virtual network and its address pool; repeatable. "
+            "Example: --network podnet=10.42.0.0/24"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -559,6 +705,7 @@ def main() -> int:
         os.path.abspath(args.socket),
         quiet=not args.verbose,
         internet_networks=parse_network_list(args.internet_networks),
+        networks=args.network,
     )
     try:
         service.serve_forever()

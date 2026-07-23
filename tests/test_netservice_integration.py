@@ -8,6 +8,7 @@ import time
 import unittest
 
 from netservice.server import VirtualNetworkService, parse_network_list
+from netservice.server import parse_network_definition
 from virtual_network import (
     ContainerNetworkConfig,
     NetworkServiceClient,
@@ -17,6 +18,147 @@ from virtual_network import (
 
 
 class NetserviceIntegrationTests(unittest.TestCase):
+    def test_predefined_network_allocates_addresses_from_configured_subnet(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "net.unix")
+            service = VirtualNetworkService(
+                socket_path,
+                quiet=True,
+                networks=[parse_network_definition("podnet=10.77.0.0/29")],
+            )
+            service_thread = threading.Thread(target=service.serve_forever)
+            service_thread.daemon = True
+            service_thread.start()
+            wait_for_path(socket_path)
+
+            client = NetworkServiceClient(socket_path)
+            try:
+                first = ContainerNetworkConfig(
+                    container_id="pod-01",
+                    service_socket=socket_path,
+                    interfaces=[VirtualNetworkInterface(name="eth0", network="podnet")],
+                )
+                second = ContainerNetworkConfig(
+                    container_id="pod-02",
+                    service_socket=socket_path,
+                    interfaces=[VirtualNetworkInterface(name="eth0", network="podnet")],
+                )
+
+                client.allocate_container(first)
+                client.allocate_container(second)
+
+                self.assertEqual(first.interfaces[0].ip_address, "10.77.0.2")
+                self.assertEqual(second.interfaces[0].ip_address, "10.77.0.3")
+                self.assertEqual(first.interfaces[0].gateway, "10.77.0.1")
+            finally:
+                client.release_container("pod-01")
+                client.release_container("pod-02")
+                client.close()
+                service.stop()
+                poke_unix_socket(socket_path)
+                service_thread.join(timeout=2)
+
+    def test_same_pod_registrations_share_loopback_until_binding_pid_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "net.unix")
+            service = VirtualNetworkService(
+                socket_path,
+                quiet=True,
+                networks=[parse_network_definition("podnet=10.78.0.0/29")],
+            )
+            service_thread = threading.Thread(target=service.serve_forever)
+            service_thread.daemon = True
+            service_thread.start()
+            wait_for_path(socket_path)
+
+            client = NetworkServiceClient(socket_path)
+            try:
+                config = ContainerNetworkConfig(
+                    container_id="pod-01",
+                    service_socket=socket_path,
+                    interfaces=[VirtualNetworkInterface(name="eth0", network="podnet")],
+                )
+                client.allocate_container(config)
+                client.register_container(config, 1001)
+                client.register_container(config, 1002)
+
+                bind_response = client.request(
+                    {
+                        "version": 1,
+                        "type": "bind_request",
+                        "request_id": "req-loopback-bind",
+                        "container_id": "pod-01",
+                        "pid": 1001,
+                        "fd": 5,
+                        "protocol": "tcp",
+                        "interface": "eth0",
+                        "network": "podnet",
+                        "virtual_address": {
+                            "ip": "127.0.0.1",
+                            "port": 8080,
+                        },
+                    }
+                )
+                self.assertEqual(bind_response["action"], "redirect")
+
+                connect_response = client.request(
+                    {
+                        "version": 1,
+                        "type": "connect_request",
+                        "request_id": "req-loopback-connect",
+                        "container_id": "pod-01",
+                        "pid": 1002,
+                        "tid": 1002,
+                        "fd": 7,
+                        "protocol": "tcp",
+                        "address_family": "ipv4",
+                        "source": {
+                            "interface": "eth0",
+                            "network": "podnet",
+                            "ip": config.interfaces[0].ip_address,
+                            "port": 0,
+                        },
+                        "destination": {
+                            "ip": "127.0.0.1",
+                            "port": 8080,
+                        },
+                    }
+                )
+                self.assertEqual(connect_response["action"], "proxy")
+
+                client.unregister_container("pod-01", 1001)
+                refused_response = client.request(
+                    {
+                        "version": 1,
+                        "type": "connect_request",
+                        "request_id": "req-loopback-refused",
+                        "container_id": "pod-01",
+                        "pid": 1002,
+                        "tid": 1002,
+                        "fd": 8,
+                        "protocol": "tcp",
+                        "address_family": "ipv4",
+                        "source": {
+                            "interface": "eth0",
+                            "network": "podnet",
+                            "ip": config.interfaces[0].ip_address,
+                            "port": 0,
+                        },
+                        "destination": {
+                            "ip": "127.0.0.1",
+                            "port": 8080,
+                        },
+                    }
+                )
+                self.assertEqual(refused_response["action"], "deny")
+                self.assertEqual(refused_response["errno"], "ECONNREFUSED")
+            finally:
+                client.release_container("pod-01")
+                client.close()
+                service.stop()
+                poke_unix_socket(socket_path)
+                service_thread.join(timeout=2)
+
     def test_routes_virtual_connect_through_tcp_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             socket_path = os.path.join(directory, "net.unix")

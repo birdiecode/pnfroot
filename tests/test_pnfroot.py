@@ -406,6 +406,55 @@ class PnfrootTests(unittest.TestCase):
             state = json.load(handle)
         self.assertEqual(state["containers"][0]["envs"]["KUBERNETES_PORT"], "tcp://10.0.0.1:443")
 
+    def test_run_pod_sandbox_allocates_pod_ip_from_netservice(self) -> None:
+        image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
+        container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")
+        self.addCleanup(image_store.cleanup)
+        self.addCleanup(container_store.cleanup)
+        original_client = pnfroot.NetworkServiceClient
+        FakeNetworkServiceClient.released = []
+        pnfroot.NetworkServiceClient = FakeNetworkServiceClient
+        try:
+            runtime = pnfroot.RuntimeService(
+                image_store_dir=image_store.name,
+                container_store_dir=container_store.name,
+                netservice_socket="/tmp/test-net.unix",
+                pod_network_name="podnet",
+            )
+            pod_response = asyncio.run(
+                runtime.RunPodSandbox(
+                    pnfroot.api_pb2.RunPodSandboxRequest(
+                        config=pnfroot.api_pb2.PodSandboxConfig(
+                            metadata=pnfroot.api_pb2.PodSandboxMetadata(name="pod", uid="uid", namespace="default", attempt=1),
+                        )
+                    ),
+                    FakeContext(),
+                )
+            )
+            status = asyncio.run(
+                runtime.PodSandboxStatus(
+                    pnfroot.api_pb2.PodSandboxStatusRequest(pod_sandbox_id=pod_response.pod_sandbox_id),
+                    FakeContext(),
+                )
+            )
+            sandbox = runtime.find_sandbox(pod_response.pod_sandbox_id)
+            container = {"pod_sandbox_id": pod_response.pod_sandbox_id}
+            network_config = runtime.container_network_config(container)
+            asyncio.run(
+                runtime.RemovePodSandbox(
+                    pnfroot.api_pb2.RemovePodSandboxRequest(pod_sandbox_id=pod_response.pod_sandbox_id),
+                    FakeContext(),
+                )
+            )
+        finally:
+            pnfroot.NetworkServiceClient = original_client
+
+        self.assertEqual(status.status.network.ip, "10.88.0.2")
+        self.assertEqual(sandbox["network"]["network"], "podnet")
+        self.assertEqual(network_config.container_id, pod_response.pod_sandbox_id)
+        self.assertEqual(network_config.interfaces[0].ip_address, "10.88.0.2")
+        self.assertEqual(FakeNetworkServiceClient.released, [pod_response.pod_sandbox_id])
+
     def test_runtime_persists_pods_and_containers_across_restart(self) -> None:
         image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
         container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")
@@ -493,8 +542,21 @@ class PnfrootTests(unittest.TestCase):
         restored = pnfroot.RuntimeService(image_store_dir=image_store.name, container_store_dir=container_store.name)
         restored_container = restored.find_container(container_response.container_id)
         self.assertEqual(restored_container["state"], pnfroot.api_pb2.CONTAINER_EXITED)
+        self.assertEqual(restored_container["exit_code"], pnfroot.RECOVERED_CONTAINER_EXIT_CODE)
+        self.assertEqual(restored_container["status_reason"], pnfroot.RECOVERED_CONTAINER_REASON)
         self.assertGreater(restored_container["finished_at"], 0)
         self.assertIsNone(restored_container["process"])
+        status = asyncio.run(
+            restored.ContainerStatus(
+                pnfroot.api_pb2.ContainerStatusRequest(
+                    container_id=container_response.container_id,
+                ),
+                FakeContext(),
+            )
+        ).status
+        self.assertEqual(status.exit_code, pnfroot.RECOVERED_CONTAINER_EXIT_CODE)
+        self.assertEqual(status.reason, pnfroot.RECOVERED_CONTAINER_REASON)
+        self.assertIn("cannot be reattached", status.message)
 
     def test_container_env_does_not_inherit_host_prompt(self) -> None:
         runtime = self._runtime_with_rootfs_container("container-env")
@@ -511,6 +573,130 @@ class PnfrootTests(unittest.TestCase):
 
         self.assertNotIn("PS1", env)
         self.assertEqual(env["HOME"], "/root")
+
+    def test_create_container_uses_linux_user_and_env_from_config(self) -> None:
+        image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
+        container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")
+        self.addCleanup(image_store.cleanup)
+        self.addCleanup(container_store.cleanup)
+        runtime = pnfroot.RuntimeService(
+            image_store_dir=image_store.name,
+            container_store_dir=container_store.name,
+        )
+        pod_response = asyncio.run(
+            runtime.RunPodSandbox(
+                pnfroot.api_pb2.RunPodSandboxRequest(
+                    config=pnfroot.api_pb2.PodSandboxConfig(
+                        metadata=pnfroot.api_pb2.PodSandboxMetadata(
+                            name="pod",
+                            uid="uid",
+                            namespace="default",
+                            attempt=1,
+                        ),
+                    )
+                ),
+                FakeContext(),
+            )
+        )
+        container_response = asyncio.run(
+            runtime.CreateContainer(
+                pnfroot.api_pb2.CreateContainerRequest(
+                    pod_sandbox_id=pod_response.pod_sandbox_id,
+                    config=pnfroot.api_pb2.ContainerConfig(
+                        metadata=pnfroot.api_pb2.ContainerMetadata(
+                            name="container",
+                            attempt=1,
+                        ),
+                        image=pnfroot.api_pb2.ImageSpec(image=""),
+                        envs=[
+                            pnfroot.api_pb2.KeyValue(
+                                key="APP_MODE",
+                                value=b"test",
+                            ),
+                            pnfroot.api_pb2.KeyValue(
+                                key="TERM",
+                                value=b"vt100",
+                            ),
+                        ],
+                        linux=pnfroot.api_pb2.LinuxContainerConfig(
+                            security_context=pnfroot.api_pb2.LinuxContainerSecurityContext(
+                                run_as_user=pnfroot.api_pb2.Int64Value(value=33),
+                                run_as_group=pnfroot.api_pb2.Int64Value(value=44),
+                                supplemental_groups=[55, 66],
+                            )
+                        ),
+                    ),
+                    sandbox_config=pnfroot.api_pb2.PodSandboxConfig(),
+                ),
+                FakeContext(),
+            )
+        )
+
+        container = runtime.find_container(container_response.container_id)
+        self.assertEqual(container["uid"], 33)
+        self.assertEqual(container["gid"], 44)
+        self.assertEqual(container["supplemental_groups"], [55, 66])
+        self.assertEqual(runtime.container_user_ids(container), (33, 44))
+        self.assertEqual(runtime.container_env(container)["APP_MODE"], "test")
+        self.assertEqual(runtime.container_env(container)["TERM"], "vt100")
+
+        status = asyncio.run(
+            runtime.ContainerStatus(
+                pnfroot.api_pb2.ContainerStatusRequest(
+                    container_id=container_response.container_id,
+                ),
+                FakeContext(),
+            )
+        ).status
+        self.assertEqual(status.user.linux.uid, 33)
+        self.assertEqual(status.user.linux.gid, 44)
+        self.assertEqual(list(status.user.linux.supplemental_groups), [55, 66])
+
+        with open(runtime.runtime_state_path(), "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        persisted = state["containers"][0]
+        self.assertEqual(persisted["uid"], 33)
+        self.assertEqual(persisted["gid"], 44)
+        self.assertEqual(persisted["envs"]["APP_MODE"], "test")
+
+    def test_start_process_uses_tracer_when_linux_user_is_configured(self) -> None:
+        image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
+        container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")
+        self.addCleanup(image_store.cleanup)
+        self.addCleanup(container_store.cleanup)
+        runtime = pnfroot.RuntimeService(
+            image_store_dir=image_store.name,
+            container_store_dir=container_store.name,
+        )
+        container = {
+            "id": "container-user",
+            "pod_sandbox_id": "pod",
+            "image_ref": "",
+            "working_dir": None,
+            "envs": {"APP_MODE": "test"},
+            "uid": 33,
+            "gid": 44,
+        }
+        calls = []
+
+        def fail_host_process(*args, **kwargs):
+            raise AssertionError("host subprocess path should not be used")
+
+        def fake_containerized_process(container_arg, command_arg, **kwargs):
+            calls.append((container_arg, command_arg, kwargs))
+            return object(), None
+
+        runtime.start_host_process = fail_host_process
+        runtime.start_containerized_process = fake_containerized_process
+
+        process, tty_fd = runtime.start_process(container, ["/bin/id"], stdout=True)
+
+        self.assertIsNotNone(process)
+        self.assertIsNone(tty_fd)
+        self.assertEqual(calls[0][1], ["/bin/id"])
+        self.assertIsNone(calls[0][2]["rootfs"])
+        self.assertIsNone(calls[0][2]["network_config"])
+        self.assertEqual(calls[0][2]["user_ids"], (33, 44))
 
     def _runtime_with_running_container(self, container_id: str):
         image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
@@ -583,6 +769,33 @@ class PnfrootTests(unittest.TestCase):
 class FakeContext:
     async def abort(self, code, message):
         raise AssertionError(f"unexpected abort {code}: {message}")
+
+
+class FakeNetworkServiceClient:
+    released = []
+
+    def __init__(self, socket_path):
+        self.socket_path = socket_path
+
+    def allocate_container(self, config):
+        interface = config.interfaces[0]
+        interface.apply_service_update(
+            {
+                "ip": "10.88.0.2",
+                "prefix_length": 24,
+                "gateway": "10.88.0.1",
+            }
+        )
+        return {
+            "success": True,
+            "interfaces": [interface.to_message()],
+        }
+
+    def release_container(self, container_id):
+        self.released.append(container_id)
+
+    def close(self):
+        pass
 
 
 class ExpectedAbort(Exception):

@@ -161,7 +161,7 @@ Unregistration:
 
 The runtime tracks `socket`, `connect`, `bind`, `accept`, `accept4`, `close`,
 `dup`, `dup2`, `dup3`, `close_range`, `getsockname`, `getpeername`, `sendto`,
-`sendmsg`, and `recvmsg`.
+`sendmsg`, `write`, `recvmsg`, and `ioctl(SIOCGIFTXQLEN)`.
 
 For `NETLINK_ROUTE` sockets, the runtime emulates the minimal rtnetlink dump
 used by `ip a`: `RTM_GETLINK` and `RTM_GETADDR` return `lo` plus the configured
@@ -192,8 +192,8 @@ The prototype is intentionally minimal:
   `bind` for the matching virtual container port.
 * There is no virtual DNS proxy yet.
 * Minimal rtnetlink interface discovery for `ip a` is implemented. Broader
-  netlink families/messages, `ioctl(SIOCGIF*)`, `/proc/net/*`, and
-  `/sys/class/net` are not fully emulated yet.
+  netlink families/messages, other `ioctl(SIOCGIF*)` requests, `/proc/net/*`,
+  and `/sys/class/net` are not fully emulated yet.
 * The service allows traffic within the same logical network and denies direct
   cross-network routing.
 * `bind` registration is optimistic: if the traced process later fails the real

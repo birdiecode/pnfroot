@@ -43,13 +43,15 @@ class InterfaceRecord:
 @dataclass
 class ContainerRecord:
     container_id: str
-    pid: int
+    pids: set[int]
     interfaces: list[InterfaceRecord]
+    leased: bool = False
 
 
 @dataclass
 class PortMapping:
     container_id: str
+    pid: int
     interface: str
     network: str
     virtual_ip: str
@@ -57,9 +59,16 @@ class PortMapping:
     protocol: str
     real_ip: str
     real_port: int
+    scope: str = ""
 
-    def virtual_key(self) -> tuple[str, str, int, str]:
-        return (self.network, self.virtual_ip, self.virtual_port, self.protocol)
+    def virtual_key(self) -> tuple[str, str, str, int, str]:
+        return (
+            self.network,
+            self.scope,
+            self.virtual_ip,
+            self.virtual_port,
+            self.protocol,
+        )
 
 
 @dataclass
@@ -70,40 +79,150 @@ class NetworkState:
     interfaces_by_ip: dict[str, InterfaceRecord] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class NetworkDefinition:
+    name: str
+    subnet: ipaddress.IPv4Network
+    gateway: str | None = None
+
+
 class VirtualNetworkRegistry:
-    def __init__(self) -> None:
+    def __init__(self, networks: list[NetworkDefinition] | None = None) -> None:
         self._lock = threading.RLock()
         self.containers: dict[str, ContainerRecord] = {}
         self.networks: dict[str, NetworkState] = {}
-        self.ports: dict[tuple[str, str, int, str], PortMapping] = {}
+        self.ports: dict[tuple[str, str, str, int, str], PortMapping] = {}
+        for network in networks or []:
+            self.define_network(network)
+
+    def define_network(self, definition: NetworkDefinition) -> None:
+        with self._lock:
+            gateway = definition.gateway or default_gateway(definition.subnet)
+            try:
+                gateway_address = ipaddress.IPv4Address(gateway)
+            except ValueError as exc:
+                raise RegistryError(f"invalid gateway: {gateway}", "EINVAL") from exc
+            if gateway_address not in definition.subnet:
+                raise RegistryError(
+                    f"gateway is outside subnet: {gateway}",
+                    "EINVAL",
+                )
+
+            existing = self.networks.get(definition.name)
+            if existing is not None:
+                if existing.subnet != definition.subnet or existing.gateway != gateway:
+                    raise RegistryError(
+                        f"network is already defined: {definition.name}",
+                        "EADDRINUSE",
+                    )
+                return
+
+            self.networks[definition.name] = NetworkState(
+                name=definition.name,
+                subnet=definition.subnet,
+                gateway=gateway,
+            )
+
+    def allocate_container(
+        self, container_id: str, interfaces: list[dict[str, object]]
+    ) -> list[InterfaceRecord]:
+        return self._ensure_container(container_id, None, interfaces, leased=True)
 
     def register_container(
         self, container_id: str, pid: int, interfaces: list[dict[str, object]]
     ) -> list[InterfaceRecord]:
+        return self._ensure_container(container_id, pid, interfaces, leased=False)
+
+    def _ensure_container(
+        self,
+        container_id: str,
+        pid: int | None,
+        interfaces: list[dict[str, object]],
+        *,
+        leased: bool,
+    ) -> list[InterfaceRecord]:
         with self._lock:
-            self.unregister_container(container_id)
+            existing = self.containers.get(container_id)
+            if existing is not None:
+                self._validate_existing_interfaces(container_id, existing, interfaces)
+                if pid is not None:
+                    existing.pids.add(pid)
+                existing.leased = existing.leased or leased
+                return existing.interfaces
+
             records = [
                 self._register_interface(container_id, interface)
                 for interface in interfaces
             ]
             self.containers[container_id] = ContainerRecord(
                 container_id=container_id,
-                pid=pid,
+                pids={pid} if pid is not None else set(),
                 interfaces=records,
+                leased=leased,
             )
             return records
 
-    def unregister_container(self, container_id: str) -> None:
+    def unregister_container(self, container_id: str, pid: int | None = None) -> bool:
+        with self._lock:
+            record = self.containers.get(container_id)
+            if record is None:
+                return False
+
+            if pid is not None:
+                record.pids.discard(pid)
+                self._release_port_mappings(container_id, pid=pid)
+                if record.pids or record.leased:
+                    return False
+
+            return self.release_container(container_id)
+
+    def release_container(self, container_id: str) -> bool:
         with self._lock:
             record = self.containers.pop(container_id, None)
-            if record is not None:
-                for interface in record.interfaces:
-                    network = self.networks.get(interface.network)
-                    if network is not None:
-                        network.interfaces_by_ip.pop(interface.ip, None)
+            if record is None:
+                return False
+            for interface in record.interfaces:
+                network = self.networks.get(interface.network)
+                if network is not None:
+                    network.interfaces_by_ip.pop(interface.ip, None)
             for key, mapping in list(self.ports.items()):
                 if mapping.container_id == container_id:
                     self.ports.pop(key, None)
+            return True
+
+    def _release_port_mappings(self, container_id: str, pid: int | None = None) -> None:
+        for key, mapping in list(self.ports.items()):
+            if mapping.container_id != container_id:
+                continue
+            if pid is not None and mapping.pid != pid:
+                continue
+            self.ports.pop(key, None)
+
+    def _validate_existing_interfaces(
+        self,
+        container_id: str,
+        existing: ContainerRecord,
+        interfaces: list[dict[str, object]],
+    ) -> None:
+        existing_by_key = {
+            (interface.name, interface.network): interface
+            for interface in existing.interfaces
+        }
+        for data in interfaces:
+            name = require_string(data, "name")
+            network_name = require_string(data, "network")
+            record = existing_by_key.get((name, network_name))
+            if record is None:
+                raise RegistryError(
+                    f"network namespace already has different interfaces: {container_id}",
+                    "EINVAL",
+                )
+            ip_value = optional_string(data.get("ip"))
+            if ip_value is not None and ip_value != record.ip:
+                raise RegistryError(
+                    f"network namespace address mismatch: {ip_value} != {record.ip}",
+                    "EINVAL",
+                )
 
     def _register_interface(
         self, container_id: str, data: dict[str, object]
@@ -158,7 +277,7 @@ class VirtualNetworkRegistry:
             subnet = ipaddress.ip_network(f"{ip_value}/{prefix}", strict=False)
         else:
             subnet = deterministic_subnet(name)
-        gateway = str(next(subnet.hosts()))
+        gateway = default_gateway(subnet)
         state = NetworkState(name=name, subnet=subnet, gateway=gateway)
         self.networks[name] = state
         return state
@@ -175,6 +294,7 @@ class VirtualNetworkRegistry:
     def bind_port(
         self,
         container_id: str,
+        pid: int,
         interface_name: str,
         network_name: str,
         virtual_ip: str,
@@ -185,18 +305,22 @@ class VirtualNetworkRegistry:
             interface = self.interface(container_id, interface_name, network_name)
             if virtual_ip == "0.0.0.0":
                 virtual_ip = interface.ip
-            if virtual_ip != interface.ip:
+            scope = ""
+            if is_loopback_ip(virtual_ip):
+                scope = container_id
+            elif virtual_ip != interface.ip:
                 raise RegistryError(f"address is not assigned: {virtual_ip}", "EADDRNOTAVAIL")
 
-            key = (network_name, virtual_ip, virtual_port, protocol)
+            key = (network_name, scope, virtual_ip, virtual_port, protocol)
             if key in self.ports:
                 raise RegistryError(
-                    f"address is already allocated: {virtual_ip}:{virtual_port}",
+                f"address is already allocated: {virtual_ip}:{virtual_port}",
                     "EADDRINUSE",
                 )
             real_ip, real_port = reserve_loopback_port()
             mapping = PortMapping(
                 container_id=container_id,
+                pid=pid,
                 interface=interface_name,
                 network=network_name,
                 virtual_ip=virtual_ip,
@@ -204,6 +328,7 @@ class VirtualNetworkRegistry:
                 protocol=protocol,
                 real_ip=real_ip,
                 real_port=real_port,
+                scope=scope,
             )
             self.ports[key] = mapping
             return mapping
@@ -223,13 +348,14 @@ class VirtualNetworkRegistry:
         with self._lock:
             self.ensure_source_network(container_id, network_name)
             network = self.networks[network_name]
-            if destination_ip not in network.interfaces_by_ip:
+            scope = container_id if is_loopback_ip(destination_ip) else ""
+            if not scope and destination_ip not in network.interfaces_by_ip:
                 raise RegistryError(
                     f"host is unreachable: {destination_ip}",
                     "EHOSTUNREACH",
                 )
 
-            key = (network_name, destination_ip, destination_port, protocol)
+            key = (network_name, scope, destination_ip, destination_port, protocol)
             mapping = self.ports.get(key)
             if mapping is None:
                 raise RegistryError(
@@ -276,6 +402,20 @@ def deterministic_subnet(network_name: str) -> ipaddress.IPv4Network:
     second_octet = 16 + digest[0] % 200
     third_octet = digest[1]
     return ipaddress.ip_network(f"10.{second_octet}.{third_octet}.0/24")
+
+
+def default_gateway(subnet: ipaddress.IPv4Network) -> str:
+    try:
+        return str(next(subnet.hosts()))
+    except StopIteration as exc:
+        raise RegistryError(f"network has no usable addresses: {subnet}", "EINVAL") from exc
+
+
+def is_loopback_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
 
 
 def reserve_loopback_port() -> tuple[str, int]:
