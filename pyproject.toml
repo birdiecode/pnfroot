@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pnfroot"
+version = "0.1.0"
+description = "Experimental rootless container runtime with partial Kubernetes CRI support."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "grpcio==1.82.1",
+    "protobuf==7.35.1",
+    "typing-extensions==4.16.0",
+]
+
+[tool.setuptools]
+py-modules = [
+    "cri_common",
+    "image_service",
+    "image_store",
+    "pnfroot",
+    "ptrace_common",
+    "ptrace_syscalls",
+    "streaming",
+    "virtual_ids",
+    "virtual_network",
+    "virtual_paths",
+]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["netservice*", "tools*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+tools = ["api.proto", "crictl", "crictl.yaml"]
