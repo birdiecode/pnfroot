@@ -1,0 +1,10 @@
+{
+  "metadata": {
+    "name": "quickstart-pod",
+    "uid": "quickstart-uid",
+    "namespace": "default",
+    "attempt": 1
+  },
+  "log_directory": "/tmp/pnfroot-quickstart/logs",
+  "linux": {}
+}

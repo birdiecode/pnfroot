@@ -1,0 +1,18 @@
+{
+  "metadata": {
+    "name": "quickstart-container",
+    "attempt": 1
+  },
+  "image": {
+    "image": "busybox:1.38.0"
+  },
+  "command": [
+    "/bin/sh"
+  ],
+  "args": [
+    "-c",
+    "echo quickstart-ready; sleep 3600"
+  ],
+  "log_path": "quickstart-container.log",
+  "linux": {}
+}

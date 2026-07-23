@@ -659,6 +659,48 @@ class PnfrootTests(unittest.TestCase):
         self.assertEqual(persisted["gid"], 44)
         self.assertEqual(persisted["envs"]["APP_MODE"], "test")
 
+    def test_create_container_resolves_log_path_from_sandbox_log_directory(self) -> None:
+        image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
+        container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")
+        self.addCleanup(image_store.cleanup)
+        self.addCleanup(container_store.cleanup)
+        runtime = pnfroot.RuntimeService(image_store_dir=image_store.name, container_store_dir=container_store.name)
+        log_directory = Path(container_store.name) / "logs"
+        sandbox_config = pnfroot.api_pb2.PodSandboxConfig(
+            metadata=pnfroot.api_pb2.PodSandboxMetadata(
+                name="pod",
+                uid="pod-uid",
+                namespace="default",
+                attempt=1,
+            ),
+            log_directory=str(log_directory),
+            linux=pnfroot.api_pb2.LinuxPodSandboxConfig(),
+        )
+        pod_response = asyncio.run(
+            runtime.RunPodSandbox(
+                pnfroot.api_pb2.RunPodSandboxRequest(config=sandbox_config),
+                FakeContext(),
+            )
+        )
+
+        container_response = asyncio.run(
+            runtime.CreateContainer(
+                pnfroot.api_pb2.CreateContainerRequest(
+                    pod_sandbox_id=pod_response.pod_sandbox_id,
+                    config=pnfroot.api_pb2.ContainerConfig(
+                        metadata=pnfroot.api_pb2.ContainerMetadata(name="container", attempt=1),
+                        image=pnfroot.api_pb2.ImageSpec(image=""),
+                        log_path="quickstart-container.log",
+                    ),
+                    sandbox_config=sandbox_config,
+                ),
+                FakeContext(),
+            )
+        )
+
+        container = runtime.find_container(container_response.container_id)
+        self.assertEqual(container["log_path"], str(log_directory / "quickstart-container.log"))
+
     def test_start_process_uses_tracer_when_linux_user_is_configured(self) -> None:
         image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
         container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")

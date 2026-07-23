@@ -109,6 +109,7 @@ RECOVERED_CONTAINER_REASON = "ContainerStatusUnknown"
 RECOVERED_CONTAINER_MESSAGE = (
     "container was running before pnfroot restart and cannot be reattached"
 )
+DEFAULT_CRI_LOG_DIR = "/tmp/pnfroot"
 
 
 def pipe_to_cri_log(pipe, log_path: str, stream: str) -> None:
@@ -797,6 +798,13 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             container["start_condition"] = condition
         return condition
 
+    def container_log_path_from_config(self, container_id: str, config: Any, sandbox_config: Any) -> str:
+        log_path = getattr(config, "log_path", "") or f"{container_id}.log"
+        if os.path.isabs(log_path):
+            return log_path
+        log_directory = getattr(sandbox_config, "log_directory", "") or DEFAULT_CRI_LOG_DIR
+        return str(Path(log_directory) / log_path)
+
     def prepare_container_rootfs_async(self, container: dict[str, Any]) -> None:
         if not container.get("image_ref"):
             return
@@ -1174,12 +1182,22 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             container["start_thread"] = thread
             thread.start()
 
+    def wait_for_container_start(self, container: dict[str, Any]) -> None:
+        condition = self.container_start_condition(container)
+        with condition:
+            while container.get("start_status") == "starting":
+                condition.wait(timeout=0.1)
+            if container.get("start_status") == "error":
+                raise RuntimeError(container.get("start_error") or "container start failed")
+
     def _start_container_process(self, container: dict[str, Any]) -> None:
         condition = self.container_start_condition(container)
         try:
-            log_dir = Path("/tmp/pnfroot")
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = str(log_dir / f"{container['id']}.log")
+            log_path = str(
+                container.get("log_path")
+                or Path(DEFAULT_CRI_LOG_DIR) / f"{container['id']}.log"
+            )
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
             process, _ = self.start_process(
                 container,
                 self.build_command(container),
@@ -1202,7 +1220,6 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
                 return
 
             container["process"] = process
-            container["log_path"] = log_path
             threading.Thread(target=pipe_to_cri_log, args=(process.stdout, log_path, "stdout"), daemon=True).start()
             threading.Thread(target=pipe_to_cri_log, args=(process.stderr, log_path, "stderr"), daemon=True).start()
             with condition:
@@ -1354,6 +1371,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         identity = self.container_identity_from_config(config, request.sandbox_config)
 
         bundle_path = self.container_store_dir / container_id
+        log_path = self.container_log_path_from_config(container_id, config, request.sandbox_config)
         container = {
             "id": container_id,
             "pod_sandbox_id": sandbox_id,
@@ -1363,7 +1381,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "command": list(config.command) if config.command else [],
             "args": list(config.args) if config.args else [],
             "working_dir": config.working_dir or None,
-            "log_path": f"{container_id}.log",
+            "log_path": log_path,
             "envs": normalize_envs(config.envs),
             "uid": identity["uid"],
             "gid": identity["gid"],
@@ -1399,11 +1417,11 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             if container.get("rootfs_status") == "error":
                 await context.abort(grpc.StatusCode.UNKNOWN, container.get("rootfs_error") or "rootfs preparation failed")
             self.start_container_process_async(container)
+            try:
+                self.wait_for_container_start(container)
+            except RuntimeError as exc:
+                await context.abort(grpc.StatusCode.UNKNOWN, str(exc))
 
-        container["state"] = api_pb2.CONTAINER_RUNNING
-        if container["started_at"] == 0:
-            container["started_at"] = int(time.time() * 1_000_000_000)
-        self.save_runtime_state()
         return api_pb2.StartContainerResponse()
 
     @log_rpc
