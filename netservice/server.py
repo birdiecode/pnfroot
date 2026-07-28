@@ -545,15 +545,30 @@ class VirtualNetworkService:
 
     def handle_list_publishes(self, message: dict[str, object]) -> dict[str, object]:
         publishes = []
+        seen: set[tuple[str, str, int, int, str]] = set()
         with self._publish_lock:
             for key, active in self.active_publishes.items():
+                seen.add(key[:5])
                 publishes.append({
                     "container_id": key[0],
                     "host_ip": key[1],
                     "host_port": key[2],
                     "container_port": key[3],
                     "protocol": key[4],
+                    "state": "active",
                 })
+            for container_id, rules in self.publish_rules.items():
+                for rule in rules:
+                    key = rule.key()
+                    if key not in seen:
+                        publishes.append({
+                            "container_id": key[0],
+                            "host_ip": key[1],
+                            "host_port": key[2],
+                            "container_port": key[3],
+                            "protocol": key[4],
+                            "state": "pending",
+                        })
         return {
             "version": 1,
             "type": "list_publishes_result",

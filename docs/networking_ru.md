@@ -223,6 +223,22 @@ Peering разрешает маршрутизацию из исходной се
 Peering направленный: `peer_networks A B` разрешает трафик от A к B, но не
 от B к A (для двустороннего доступа укажите peering в обратную сторону).
 
+### Контейнеры
+
+Список зарегистрированных контейнеров, опционально с фильтром по сети:
+
+```json
+{"version":1,"type":"list_containers","network":"backend"}
+```
+
+`network` опционален — без него возвращаются все контейнеры.
+
+Ответ:
+
+```json
+{"version":1,"type":"list_containers_result","success":true,"containers":[{"container_id":"app-01","pids":[15432],"leased":false,"interfaces":[{"name":"eth0","network":"backend","ip":"10.20.0.10","prefix_length":24,"gateway":"10.20.0.1","mac":null,"mtu":1500,"dns":[]}]}]}
+```
+
 ### Интроспекция
 
 Список всех определённых сетей с подсетями и количеством занятых адресов:
@@ -241,6 +257,20 @@ Peering направленный: `peer_networks A B` разрешает тра�
 
 ```json
 {"version":1,"type":"list_publishes"}
+```
+
+### Связи (peering)
+
+Список активных направленных связей между сетями:
+
+```json
+{"version":1,"type":"list_peerings"}
+```
+
+Ответ:
+
+```json
+{"version":1,"type":"list_peerings_result","success":true,"peerings":[{"source":"frontend","target":"backend"}]}
 ```
 
 ### Использование с `nc` (netcat)
