@@ -92,6 +92,7 @@ class VirtualNetworkRegistry:
         self.containers: dict[str, ContainerRecord] = {}
         self.networks: dict[str, NetworkState] = {}
         self.ports: dict[tuple[str, str, str, int, str], PortMapping] = {}
+        self.peered_networks: dict[str, set[str]] = {}
         for network in networks or []:
             self.define_network(network)
 
@@ -122,6 +123,88 @@ class VirtualNetworkRegistry:
                 subnet=definition.subnet,
                 gateway=gateway,
             )
+
+    def remove_network(self, name: str) -> None:
+        with self._lock:
+            network = self.networks.pop(name, None)
+            if network is None:
+                raise RegistryError(f"network does not exist: {name}", "ENETUNREACH")
+            for container in list(self.containers.values()):
+                container.interfaces[:] = [
+                    iface for iface in container.interfaces if iface.network != name
+                ]
+            for key in list(self.ports):
+                if key[0] == name:
+                    self.ports.pop(key, None)
+            self.peered_networks.pop(name, None)
+            for targets in self.peered_networks.values():
+                targets.discard(name)
+
+    def peer_networks(self, source: str, target: str) -> None:
+        with self._lock:
+            if source not in self.networks:
+                raise RegistryError(f"network does not exist: {source}", "ENETUNREACH")
+            if target not in self.networks:
+                raise RegistryError(f"network does not exist: {target}", "ENETUNREACH")
+            if source == target:
+                raise RegistryError("cannot peer network with itself", "EINVAL")
+            self.peered_networks.setdefault(source, set()).add(target)
+
+    def unpeer_networks(self, source: str, target: str) -> None:
+        with self._lock:
+            self.peered_networks.get(source, set()).discard(target)
+
+    def list_peerings(self) -> list[dict[str, str]]:
+        with self._lock:
+            result: list[dict[str, str]] = []
+            for source, targets in sorted(self.peered_networks.items()):
+                for target in sorted(targets):
+                    result.append({"source": source, "target": target})
+            return result
+
+    def list_containers(
+        self, network_name: str | None = None
+    ) -> list[dict[str, object]]:
+        with self._lock:
+            result: list[dict[str, object]] = []
+            for cid in sorted(self.containers):
+                record = self.containers[cid]
+                interfaces = [
+                    {
+                        "name": iface.name,
+                        "network": iface.network,
+                        "ip": iface.ip,
+                        "prefix_length": iface.prefix_length,
+                        "gateway": iface.gateway,
+                        "mac": iface.mac,
+                        "mtu": iface.mtu,
+                        "dns": list(iface.dns),
+                    }
+                    for iface in record.interfaces
+                    if network_name is None or iface.network == network_name
+                ]
+                if not interfaces:
+                    continue
+                result.append({
+                    "container_id": cid,
+                    "pids": sorted(record.pids),
+                    "leased": record.leased,
+                    "interfaces": interfaces,
+                })
+            return result
+
+    def find_mapping(
+        self, container_id: str, virtual_port: int, protocol: str
+    ) -> PortMapping | None:
+        with self._lock:
+            for mapping in self.ports.values():
+                if (
+                    mapping.container_id == container_id
+                    and mapping.virtual_port == virtual_port
+                    and mapping.protocol == protocol
+                ):
+                    return mapping
+            return None
 
     def allocate_container(
         self, container_id: str, interfaces: list[dict[str, object]]
@@ -349,7 +432,12 @@ class VirtualNetworkRegistry:
             self.ensure_source_network(container_id, network_name)
             network = self.networks[network_name]
             scope = container_id if is_loopback_ip(destination_ip) else ""
-            if not scope and destination_ip not in network.interfaces_by_ip:
+            if scope == "" and destination_ip not in network.interfaces_by_ip:
+                mapping = self._route_via_peered(
+                    network_name, destination_ip, destination_port, protocol
+                )
+                if mapping is not None:
+                    return mapping
                 raise RegistryError(
                     f"host is unreachable: {destination_ip}",
                     "EHOSTUNREACH",
@@ -363,6 +451,24 @@ class VirtualNetworkRegistry:
                     "ECONNREFUSED",
                 )
             return mapping
+
+    def _route_via_peered(
+        self,
+        source_network: str,
+        destination_ip: str,
+        destination_port: int,
+        protocol: str,
+    ) -> PortMapping | None:
+        for peered_name in self.peered_networks.get(source_network, set()):
+            peered_network = self.networks.get(peered_name)
+            if peered_network is None:
+                continue
+            if destination_ip in peered_network.interfaces_by_ip:
+                key = (peered_name, "", destination_ip, destination_port, protocol)
+                mapping = self.ports.get(key)
+                if mapping is not None:
+                    return mapping
+        return None
 
     def ensure_source_network(self, container_id: str, network_name: str) -> None:
         with self._lock:

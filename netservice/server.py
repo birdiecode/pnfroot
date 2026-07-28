@@ -165,6 +165,26 @@ class VirtualNetworkService:
                 return self.handle_bind_request(message)
             if message_type == "connect_request":
                 return self.handle_connect_request(message)
+            if message_type == "publish_port":
+                return self.handle_publish_port(message)
+            if message_type == "unpublish_port":
+                return self.handle_unpublish_port(message)
+            if message_type == "define_network":
+                return self.handle_define_network(message)
+            if message_type == "remove_network":
+                return self.handle_remove_network(message)
+            if message_type == "peer_networks":
+                return self.handle_peer_networks(message)
+            if message_type == "unpeer_networks":
+                return self.handle_unpeer_networks(message)
+            if message_type == "list_networks":
+                return self.handle_list_networks(message)
+            if message_type == "list_publishes":
+                return self.handle_list_publishes(message)
+            if message_type == "list_peerings":
+                return self.handle_list_peerings(message)
+            if message_type == "list_containers":
+                return self.handle_list_containers(message)
         except RegistryError as exc:
             self.log(f"{message_type} denied: {exc.errno_name} {exc}")
             return error_response(message, exc.errno_name, str(exc))
@@ -377,6 +397,170 @@ class VirtualNetworkService:
             },
         }
 
+    def handle_publish_port(self, message: dict[str, object]) -> dict[str, object]:
+        container_id = require_string(message, "container_id")
+        host_ip = require_string(message, "host_ip")
+        host_port = require_int(message, "host_port")
+        container_port = require_int(message, "container_port")
+        protocol_value = message.get("protocol", "tcp")
+        if not isinstance(protocol_value, str) or not protocol_value:
+            raise ValueError("missing field: protocol")
+        protocol = protocol_value.lower()
+
+        validate_publish_ip(host_ip)
+        validate_publish_port(host_port, "host_port")
+        validate_publish_port(container_port, "container_port")
+        if protocol != "tcp":
+            raise ValueError("publish currently supports only tcp")
+
+        rule = PublishRule(container_id, host_ip, host_port, container_port, protocol)
+        with self._publish_lock:
+            rules = self.publish_rules.setdefault(container_id, [])
+            for existing in rules:
+                if existing.key() == rule.key():
+                    return {"version": 1, "type": "publish_port_result", "success": True}
+            rules.append(rule)
+            mapping = self.registry.find_mapping(container_id, container_port, protocol)
+            if mapping is not None and rule.key() not in self.active_publishes:
+                forwarder_id = f"pub-{container_id}-{host_ip}-{host_port}-{container_port}"
+                forwarder, address = self.proxy_manager.create_forwarder(
+                    forwarder_id=forwarder_id,
+                    listen_host=host_ip,
+                    listen_port=host_port,
+                    target_host=mapping.real_ip,
+                    target_port=mapping.real_port,
+                )
+                self.active_publishes[rule.key()] = ActivePublish(
+                    rule=rule, mapping=mapping, forwarder=forwarder
+                )
+                self.log(
+                    f"published {address[0]}:{address[1]} -> "
+                    f"{mapping.network}/{mapping.virtual_ip}:{mapping.virtual_port} "
+                    f"({mapping.real_ip}:{mapping.real_port})"
+                )
+        return {"version": 1, "type": "publish_port_result", "success": True}
+
+    def handle_unpublish_port(self, message: dict[str, object]) -> dict[str, object]:
+        container_id = require_string(message, "container_id")
+        host_ip = require_string(message, "host_ip")
+        host_port = require_int(message, "host_port")
+        protocol_value = message.get("protocol", "tcp")
+        protocol = protocol_value if isinstance(protocol_value, str) else "tcp"
+
+        remove_all = message.get("all", False)
+        with self._publish_lock:
+            rules = self.publish_rules.get(container_id, [])
+            if remove_all:
+                for key in [
+                    k for k in self.active_publishes if k[0] == container_id
+                ]:
+                    self.deactivate_published_port(key)
+                self.publish_rules.pop(container_id, None)
+            else:
+                rule_key = (container_id, host_ip, host_port, 0, protocol)
+                self.publish_rules[container_id] = [
+                    r for r in rules
+                    if not (r.host_ip == host_ip and r.host_port == host_port and r.protocol == protocol)
+                ]
+                for key in [
+                    k for k in self.active_publishes
+                    if k[0] == container_id and k[1] == host_ip and k[2] == host_port and k[4] == protocol
+                ]:
+                    self.deactivate_published_port(key)
+        return {"version": 1, "type": "unpublish_port_result", "success": True}
+
+    def handle_define_network(self, message: dict[str, object]) -> dict[str, object]:
+        name = require_string(message, "name")
+        subnet_str = require_string(message, "subnet")
+        try:
+            subnet = ipaddress.ip_network(subnet_str, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"invalid subnet: {subnet_str}") from exc
+        if not isinstance(subnet, ipaddress.IPv4Network):
+            raise ValueError("currently supports only IPv4")
+        gateway = message.get("gateway")
+        if gateway is not None and not isinstance(gateway, str):
+            raise ValueError("gateway must be a string")
+        definition = NetworkDefinition(name=name, subnet=subnet, gateway=gateway)
+        self.registry.define_network(definition)
+        self.log(f"defined network {name} {subnet}")
+        return {"version": 1, "type": "define_network_result", "success": True}
+
+    def handle_remove_network(self, message: dict[str, object]) -> dict[str, object]:
+        name = require_string(message, "name")
+        self.registry.remove_network(name)
+        self.log(f"removed network {name}")
+        return {"version": 1, "type": "remove_network_result", "success": True}
+
+    def handle_peer_networks(self, message: dict[str, object]) -> dict[str, object]:
+        source = require_string(message, "source")
+        target = require_string(message, "target")
+        self.registry.peer_networks(source, target)
+        self.log(f"peered {source} -> {target}")
+        return {"version": 1, "type": "peer_networks_result", "success": True}
+
+    def handle_unpeer_networks(self, message: dict[str, object]) -> dict[str, object]:
+        source = require_string(message, "source")
+        target = require_string(message, "target")
+        self.registry.unpeer_networks(source, target)
+        self.log(f"unpeered {source} -> {target}")
+        return {"version": 1, "type": "unpeer_networks_result", "success": True}
+
+    def handle_list_networks(self, message: dict[str, object]) -> dict[str, object]:
+        networks = []
+        for name, state in self.registry.networks.items():
+            networks.append({
+                "name": name,
+                "subnet": str(state.subnet),
+                "gateway": state.gateway,
+                "allocated": len(state.interfaces_by_ip),
+            })
+        return {
+            "version": 1,
+            "type": "list_networks_result",
+            "success": True,
+            "networks": networks,
+        }
+
+    def handle_list_containers(self, message: dict[str, object]) -> dict[str, object]:
+        network = message.get("network")
+        if network is not None and not isinstance(network, str):
+            raise ValueError("network must be a string")
+        containers = self.registry.list_containers(network)
+        return {
+            "version": 1,
+            "type": "list_containers_result",
+            "success": True,
+            "containers": containers,
+        }
+
+    def handle_list_peerings(self, message: dict[str, object]) -> dict[str, object]:
+        peerings = self.registry.list_peerings()
+        return {
+            "version": 1,
+            "type": "list_peerings_result",
+            "success": True,
+            "peerings": peerings,
+        }
+
+    def handle_list_publishes(self, message: dict[str, object]) -> dict[str, object]:
+        publishes = []
+        with self._publish_lock:
+            for key, active in self.active_publishes.items():
+                publishes.append({
+                    "container_id": key[0],
+                    "host_ip": key[1],
+                    "host_port": key[2],
+                    "container_port": key[3],
+                    "protocol": key[4],
+                })
+        return {
+            "version": 1,
+            "type": "list_publishes_result",
+            "success": True,
+            "publishes": publishes,
+        }
+
     def activate_published_ports(self, mapping: PortMapping) -> None:
         with self._publish_lock:
             rules = [
@@ -507,6 +691,26 @@ def error_response(
         response.update({"type": "release_container_result"})
     elif request_type == "register_container":
         response.update({"type": "register_container_result"})
+    elif request_type == "publish_port":
+        response.update({"type": "publish_port_result"})
+    elif request_type == "unpublish_port":
+        response.update({"type": "unpublish_port_result"})
+    elif request_type == "define_network":
+        response.update({"type": "define_network_result"})
+    elif request_type == "remove_network":
+        response.update({"type": "remove_network_result"})
+    elif request_type == "peer_networks":
+        response.update({"type": "peer_networks_result"})
+    elif request_type == "unpeer_networks":
+        response.update({"type": "unpeer_networks_result"})
+    elif request_type == "list_networks":
+        response.update({"type": "list_networks_result"})
+    elif request_type == "list_publishes":
+        response.update({"type": "list_publishes_result"})
+    elif request_type == "list_peerings":
+        response.update({"type": "list_peerings_result"})
+    elif request_type == "list_containers":
+        response.update({"type": "list_containers_result"})
     else:
         response.update({"type": "error"})
     return response
