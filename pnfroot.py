@@ -882,10 +882,53 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         return image_dir_name(image_ref)
 
     def build_command(self, container: dict[str, Any]) -> list[str]:
-        command = list(container["command"]) + list(container["args"])
-        if not command:
-            return ["/bin/sh"]
-        return command
+        container_command = list(container.get("command") or [])
+        container_args = list(container.get("args") or [])
+        if container_command:
+            return container_command + container_args
+        if container_args:
+            return self.image_config_entrypoint(container) + container_args
+
+        command = self.image_config_entrypoint(container) + self.image_config_cmd(container)
+        return command or ["/bin/sh"]
+
+    def image_config(self, container: dict[str, Any]) -> dict[str, Any]:
+        image_ref = container.get("image_ref") or ""
+        if not image_ref:
+            return {}
+
+        image_path = self.image_path(image_ref)
+        img = read_image_metadata(image_path) or {}
+        config_digest = img.get("config_digest")
+        if not isinstance(config_digest, str) or not config_digest:
+            return {}
+
+        config_path = blob_path(image_path, config_digest)
+        try:
+            with open(config_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Cannot read image config %s: %s", config_path, exc)
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def image_config_entrypoint(self, container: dict[str, Any]) -> list[str]:
+        return self.image_config_list(container, "Entrypoint")
+
+    def image_config_cmd(self, container: dict[str, Any]) -> list[str]:
+        return self.image_config_list(container, "Cmd")
+
+    def image_config_list(self, container: dict[str, Any], key: str) -> list[str]:
+        config = self.image_config(container).get("config") or {}
+        if not isinstance(config, dict):
+            return []
+
+        value = config.get(key)
+        if isinstance(value, list):
+            return [str(item) for item in value if item is not None]
+        if isinstance(value, str) and value:
+            return [value]
+        return []
 
     def container_image_name(self, container: dict[str, Any]) -> str:
         image = container.get("image")
@@ -1199,6 +1242,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
     def _start_container_process(self, container: dict[str, Any]) -> None:
         condition = self.container_start_condition(container)
         try:
+            self.wait_for_container_rootfs(container)
             log_path = str(
                 container.get("log_path")
                 or Path(DEFAULT_CRI_LOG_DIR) / f"{container['id']}.log"

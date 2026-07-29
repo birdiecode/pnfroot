@@ -315,6 +315,53 @@ class PnfrootTests(unittest.TestCase):
         repo_tags = [tag for image in images for tag in image.repo_tags]
         self.assertIn(container["image_ref"], repo_tags)
 
+    def test_build_command_uses_image_entrypoint_and_cmd_defaults(self) -> None:
+        runtime = self._runtime_with_image_config(
+            "default-command:latest",
+            {
+                "Entrypoint": ["/bin/fixture"],
+                "Cmd": ["--serve"],
+            },
+        )
+        container = self._container_for_image("default-command:latest")
+
+        self.assertEqual(runtime.build_command(container), ["/bin/fixture", "--serve"])
+
+    def test_build_command_uses_image_cmd_when_entrypoint_is_empty(self) -> None:
+        runtime = self._runtime_with_image_config(
+            "cmd-only:latest",
+            {"Cmd": ["/bin/fixture", "--once"]},
+        )
+        container = self._container_for_image("cmd-only:latest")
+
+        self.assertEqual(runtime.build_command(container), ["/bin/fixture", "--once"])
+
+    def test_build_command_keeps_image_entrypoint_when_only_args_are_overridden(self) -> None:
+        runtime = self._runtime_with_image_config(
+            "args-override:latest",
+            {
+                "Entrypoint": ["/bin/fixture"],
+                "Cmd": ["--default"],
+            },
+        )
+        container = self._container_for_image("args-override:latest")
+        container["args"] = ["--custom"]
+
+        self.assertEqual(runtime.build_command(container), ["/bin/fixture", "--custom"])
+
+    def test_build_command_uses_container_command_as_entrypoint_override(self) -> None:
+        runtime = self._runtime_with_image_config(
+            "command-override:latest",
+            {
+                "Entrypoint": ["/bin/fixture"],
+                "Cmd": ["--default"],
+            },
+        )
+        container = self._container_for_image("command-override:latest")
+        container["command"] = ["/bin/custom"]
+
+        self.assertEqual(runtime.build_command(container), ["/bin/custom"])
+
     def test_create_container_does_not_wait_for_rootfs_prepare(self) -> None:
         image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
         container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")
@@ -824,6 +871,35 @@ class PnfrootTests(unittest.TestCase):
         }
         return runtime
 
+    def _runtime_with_image_config(self, image_ref: str, image_config: dict[str, object]):
+        image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")
+        container_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-containers-")
+        source_dir = tempfile.TemporaryDirectory(prefix="pnfroot-test-source-")
+        self.addCleanup(image_store.cleanup)
+        self.addCleanup(container_store.cleanup)
+        self.addCleanup(source_dir.cleanup)
+        source_rootfs = Path(source_dir.name) / "rootfs"
+        create_minimal_rootfs(source_rootfs)
+        create_content_store_image(
+            source_rootfs,
+            Path(image_store.name),
+            image_ref=image_ref,
+            image_config=image_config,
+        )
+        return pnfroot.RuntimeService(
+            image_store_dir=image_store.name,
+            container_store_dir=container_store.name,
+        )
+
+    def _container_for_image(self, image_ref: str) -> dict[str, object]:
+        return {
+            "id": "container-image-config",
+            "image_ref": image_ref,
+            "image": pnfroot.api_pb2.ImageSpec(image=image_ref),
+            "command": [],
+            "args": [],
+        }
+
     def _fail_popen(self, *args, **kwargs):
         raise AssertionError("subprocess.Popen must not be used for rootfs containers")
 
@@ -885,6 +961,7 @@ def create_content_store_image(
     image_store: Path,
     *,
     image_ref: str = "busybox:latest",
+    image_config: dict[str, object] | None = None,
 ) -> dict[str, object]:
     image_store.mkdir(parents=True, exist_ok=True)
     image_path = image_store / pnfroot.image_dir_name(image_ref)
@@ -905,13 +982,16 @@ def create_content_store_image(
         pnfroot.sha256_bytes(layer_payload),
         layer_payload,
     )
+    config_data = {
+        "architecture": "amd64",
+        "os": "linux",
+        "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
+        "created": pnfroot.cri_time_ns(),
+    }
+    if image_config is not None:
+        config_data["config"] = image_config
     config_payload = json.dumps(
-        {
-            "architecture": "amd64",
-            "os": "linux",
-            "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
-            "created": pnfroot.cri_time_ns(),
-        },
+        config_data,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
