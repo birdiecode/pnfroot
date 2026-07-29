@@ -36,3 +36,7 @@ namespaces = true
 
 [tool.setuptools.package-data]
 tools = ["api.proto", "crictl", "crictl.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".git", ".venv", "ubuntu_c"]

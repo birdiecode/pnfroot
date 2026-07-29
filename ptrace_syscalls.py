@@ -283,6 +283,10 @@ def resume_syscall(pid: int, sig: int = 0) -> None:
     ptrace(PTRACE_SYSCALL, pid, 0, sig)
 
 
+def process_is_gone(exc: OSError) -> bool:
+    return exc.errno == errno.ESRCH
+
+
 def read_script_interpreter(path: str) -> list[str] | None:
     try:
         with open(path, "rb") as handle:
@@ -459,6 +463,29 @@ def trace(initial_pids: set[int], initial_cwd: str = "/") -> int:
     active_syscalls: dict[int, SyscallRecord] = {}
     exit_code = 0
 
+    def forget_pid(pid: int) -> None:
+        alive.discard(pid)
+        configured.discard(pid)
+        in_syscall.pop(pid, None)
+        active_syscalls.pop(pid, None)
+        if ROOTFS is not None:
+            ROOTFS.drop_pid(pid)
+        if VIRTUAL_IDS is not None:
+            VIRTUAL_IDS.drop_pid(pid)
+        if VIRTUAL_NETWORK is not None:
+            VIRTUAL_NETWORK.drop_pid(pid)
+
+    def try_resume(pid: int, sig: int = 0) -> bool:
+        try:
+            resume_syscall(pid, sig)
+        except OSError as exc:
+            if not process_is_gone(exc):
+                raise
+            trace_log(f"[pid {pid}] disappeared before ptrace resume")
+            forget_pid(pid)
+            return False
+        return True
+
     try:
         while alive:
             try:
@@ -474,16 +501,7 @@ def trace(initial_pids: set[int], initial_cwd: str = "/") -> int:
             if os.WIFEXITED(status):
                 code = os.WEXITSTATUS(status)
                 trace_log(f"[pid {pid}] exited with status {code}")
-                alive.discard(pid)
-                configured.discard(pid)
-                in_syscall.pop(pid, None)
-                active_syscalls.pop(pid, None)
-                if ROOTFS is not None:
-                    ROOTFS.drop_pid(pid)
-                if VIRTUAL_IDS is not None:
-                    VIRTUAL_IDS.drop_pid(pid)
-                if VIRTUAL_NETWORK is not None:
-                    VIRTUAL_NETWORK.drop_pid(pid)
+                forget_pid(pid)
                 if not alive:
                     exit_code = code
                 continue
@@ -491,16 +509,7 @@ def trace(initial_pids: set[int], initial_cwd: str = "/") -> int:
             if os.WIFSIGNALED(status):
                 sig = os.WTERMSIG(status)
                 trace_log(f"[pid {pid}] killed by {signal_name(sig)}")
-                alive.discard(pid)
-                configured.discard(pid)
-                in_syscall.pop(pid, None)
-                active_syscalls.pop(pid, None)
-                if ROOTFS is not None:
-                    ROOTFS.drop_pid(pid)
-                if VIRTUAL_IDS is not None:
-                    VIRTUAL_IDS.drop_pid(pid)
-                if VIRTUAL_NETWORK is not None:
-                    VIRTUAL_NETWORK.drop_pid(pid)
+                forget_pid(pid)
                 if not alive:
                     exit_code = 128 + sig
                 continue
@@ -520,46 +529,61 @@ def trace(initial_pids: set[int], initial_cwd: str = "/") -> int:
                     set_trace_options(pid)
                     configured.add(pid)
                 except OSError as exc:
+                    if process_is_gone(exc):
+                        forget_pid(pid)
+                        continue
                     trace_log(f"[pid {pid}] could not set ptrace options: {exc}")
 
             if sig == SYSCALL_STOP:
-                if in_syscall.get(pid, False):
-                    syscall_exit(pid, active_syscalls.pop(pid, None))
-                    in_syscall[pid] = False
-                else:
-                    active_syscalls[pid] = syscall_entry(pid)
-                    in_syscall[pid] = True
-                resume_syscall(pid)
+                try:
+                    if in_syscall.get(pid, False):
+                        syscall_exit(pid, active_syscalls.pop(pid, None))
+                        in_syscall[pid] = False
+                    else:
+                        active_syscalls[pid] = syscall_entry(pid)
+                        in_syscall[pid] = True
+                except OSError as exc:
+                    if not process_is_gone(exc):
+                        raise
+                    forget_pid(pid)
+                    continue
+                try_resume(pid)
                 continue
 
             if sig == signal.SIGTRAP and event:
-                if event in (PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_CLONE):
-                    child_pid = get_event_msg(pid)
-                    alive.add(child_pid)
-                    in_syscall[child_pid] = False
-                    if ROOTFS is not None:
-                        ROOTFS.inherit_pid(pid, child_pid)
-                    if VIRTUAL_IDS is not None:
-                        VIRTUAL_IDS.inherit_pid(pid, child_pid)
-                    if VIRTUAL_NETWORK is not None:
-                        VIRTUAL_NETWORK.inherit_pid(pid, child_pid)
-                    event_name = {
-                        PTRACE_EVENT_FORK: "fork",
-                        PTRACE_EVENT_VFORK: "vfork",
-                        PTRACE_EVENT_CLONE: "clone",
-                    }[event]
-                    trace_log(f"[pid {pid}] {event_name} -> new pid {child_pid}")
-                elif event == PTRACE_EVENT_EXEC:
-                    trace_log(f"[pid {pid}] exec event")
-                elif event == PTRACE_EVENT_EXIT:
-                    trace_log(f"[pid {pid}] exit event status={get_event_msg(pid)}")
+                try:
+                    if event in (PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_CLONE):
+                        child_pid = get_event_msg(pid)
+                        alive.add(child_pid)
+                        in_syscall[child_pid] = False
+                        if ROOTFS is not None:
+                            ROOTFS.inherit_pid(pid, child_pid)
+                        if VIRTUAL_IDS is not None:
+                            VIRTUAL_IDS.inherit_pid(pid, child_pid)
+                        if VIRTUAL_NETWORK is not None:
+                            VIRTUAL_NETWORK.inherit_pid(pid, child_pid)
+                        event_name = {
+                            PTRACE_EVENT_FORK: "fork",
+                            PTRACE_EVENT_VFORK: "vfork",
+                            PTRACE_EVENT_CLONE: "clone",
+                        }[event]
+                        trace_log(f"[pid {pid}] {event_name} -> new pid {child_pid}")
+                    elif event == PTRACE_EVENT_EXEC:
+                        trace_log(f"[pid {pid}] exec event")
+                    elif event == PTRACE_EVENT_EXIT:
+                        trace_log(f"[pid {pid}] exit event status={get_event_msg(pid)}")
+                except OSError as exc:
+                    if not process_is_gone(exc):
+                        raise
+                    forget_pid(pid)
+                    continue
 
-                resume_syscall(pid)
+                try_resume(pid)
                 continue
 
             trace_log(f"[pid {pid}] stopped by {signal_name(sig)}")
             deliver_signal = 0 if sig in (signal.SIGSTOP, signal.SIGTRAP) else sig
-            resume_syscall(pid, deliver_signal)
+            try_resume(pid, deliver_signal)
     except KeyboardInterrupt:
         trace_log("\nInterrupted, detaching tracees...", file=sys.stderr)
         for pid in list(alive):
