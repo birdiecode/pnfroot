@@ -266,6 +266,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         netservice_socket: str | None = None,
         pod_network_name: str | None = None,
         pod_network_interface: str = "eth0",
+        dns_servers: list[str] | None = None,
     ):
         self.image_store_dir = Path(image_store_dir)
         self.container_store_dir = Path(container_store_dir)
@@ -273,6 +274,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         self.netservice_socket = os.path.abspath(netservice_socket) if netservice_socket else None
         self.pod_network_name = pod_network_name
         self.pod_network_interface = pod_network_interface
+        self.dns_servers = list(dns_servers or [])
         self.image_store_dir.mkdir(parents=True, exist_ok=True)
         self.container_store_dir.mkdir(parents=True, exist_ok=True)
         self.sandboxes: dict[str, dict[str, Any]] = {}
@@ -314,6 +316,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         interface = VirtualNetworkInterface(
             name=self.pod_network_interface,
             network=self.pod_network_name or "",
+            dns_servers=list(self.dns_servers),
         )
         config = ContainerNetworkConfig(
             container_id=pod_id,
@@ -974,6 +977,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             rootfs=rootfs,
             network_config=network_config,
             user_ids=user_ids,
+            dns_servers=self.dns_servers,
             tty=tty,
             stdin=stdin,
             stdout=stdout,
@@ -1032,6 +1036,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
         rootfs: Path | None,
         network_config: ContainerNetworkConfig | None,
         user_ids: tuple[int, int] | None,
+        dns_servers: list[str] | None,
         tty: bool,
         stdin: bool,
         stdout: bool,
@@ -1088,6 +1093,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
                         controlling_tty=tty,
                         uid=uid,
                         gid=gid,
+                        dns_servers=dns_servers,
                         network_config=network_config,
                     )
                     os._exit(exit_code)
@@ -1620,6 +1626,18 @@ def parse_args() -> argparse.Namespace:
         default="eth0",
         help="interface name exposed inside pods when pod networking is enabled",
     )
+    parser.add_argument(
+        "--dns",
+        "--dns-server",
+        action="append",
+        default=[],
+        type=ptrace_syscalls.parse_dns_server,
+        metavar="IP",
+        help=(
+            "override /etc/resolv.conf inside rootfs containers with this DNS "
+            "server; repeatable"
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     if bool(args.netservice_socket) != bool(args.pod_network):
@@ -1647,6 +1665,7 @@ async def main() -> None:
         netservice_socket=args.netservice_socket,
         pod_network_name=args.pod_network,
         pod_network_interface=args.pod_network_interface,
+        dns_servers=args.dns,
     )
     api_pb2_grpc.add_RuntimeServiceServicer_to_server(
         runtime_service,
@@ -1666,6 +1685,8 @@ async def main() -> None:
     logger.info("Streaming server: %s:%s", args.stream_host, args.stream_port)
     if args.netservice_socket:
         logger.info("Pod network: %s via %s", args.pod_network, args.netservice_socket)
+    if args.dns:
+        logger.info("DNS servers: %s", ", ".join(args.dns))
     try:
         await server.wait_for_termination()
     finally:

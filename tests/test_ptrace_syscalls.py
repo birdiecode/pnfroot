@@ -1,6 +1,7 @@
 import errno
 import os
 import signal
+import sys
 
 import ptrace_syscalls
 
@@ -29,3 +30,27 @@ def test_trace_ignores_process_that_disappears_at_syscall_stop(monkeypatch) -> N
     monkeypatch.setattr(ptrace_syscalls, "syscall_entry", missing_process)
 
     assert ptrace_syscalls.trace({123}) == 0
+
+
+def test_parse_args_accepts_repeatable_dns_server(monkeypatch, tmp_path) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ptrace_syscalls.py",
+            "--rootfs",
+            str(rootfs),
+            "--dns-server",
+            "8.8.8.8",
+            "--dns",
+            "1.1.1.1",
+            "--",
+            "/bin/sh",
+        ],
+    )
+
+    args = ptrace_syscalls.parse_args()
+
+    assert args.dns == ["8.8.8.8", "1.1.1.1"]

@@ -739,6 +739,26 @@ class PnfrootTests(unittest.TestCase):
         self.assertIsNone(calls[0][2]["rootfs"])
         self.assertIsNone(calls[0][2]["network_config"])
         self.assertEqual(calls[0][2]["user_ids"], (33, 44))
+        self.assertEqual(calls[0][2]["dns_servers"], [])
+
+    def test_start_process_passes_dns_servers_to_tracer(self) -> None:
+        runtime = self._runtime_with_rootfs_container("container-dns")
+        runtime.dns_servers = ["8.8.8.8", "1.1.1.1"]
+        container = runtime.find_container("container-dns")
+        calls = []
+
+        def fake_containerized_process(container_arg, command_arg, **kwargs):
+            calls.append((container_arg, command_arg, kwargs))
+            return object(), None
+
+        runtime.start_containerized_process = fake_containerized_process
+
+        process, tty_fd = runtime.start_process(container, ["/bin/sh"], stdout=True)
+
+        self.assertIsNotNone(process)
+        self.assertIsNone(tty_fd)
+        self.assertEqual(calls[0][2]["rootfs"], Path("/"))
+        self.assertEqual(calls[0][2]["dns_servers"], ["8.8.8.8", "1.1.1.1"])
 
     def _runtime_with_running_container(self, container_id: str):
         image_store = tempfile.TemporaryDirectory(prefix="pnfroot-test-images-")

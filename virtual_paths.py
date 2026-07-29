@@ -45,6 +45,9 @@ VIRTUAL_MOUNT_FILES = {
 VIRTUAL_PROC_FILES = {
     "/proc/filesystems": "filesystems",
 }
+VIRTUAL_DNS_FILES = {
+    "/etc/resolv.conf": "resolv.conf",
+}
 VIRTUAL_MOUNT_FILE_SYSCALLS = {
     "access",
     "faccessat",
@@ -294,13 +297,19 @@ class TraceeScratch:
 
 
 class VirtualRoot:
-    def __init__(self, root: str, binds: list[BindMount] | None = None):
+    def __init__(
+        self,
+        root: str,
+        binds: list[BindMount] | None = None,
+        dns_servers: list[str] | None = None,
+    ):
         self.root = os.path.abspath(root)
         self.binds = sorted(
             binds or [],
             key=lambda bind: len(split_virtual_path(bind.virtual_path)),
             reverse=True,
         )
+        self.dns_servers = list(dns_servers or [])
         self.ensure_bind_mountpoints()
         self.cwd_by_pid: dict[int, str] = {}
         self.fd_paths_by_pid: dict[int, dict[int, str]] = {}
@@ -391,6 +400,8 @@ class VirtualRoot:
 
     def virtual_generated_file_kind(self, virtual_path: str) -> str | None:
         virtual_path = normalize_virtual_path(virtual_path)
+        if self.dns_servers and virtual_path in VIRTUAL_DNS_FILES:
+            return VIRTUAL_DNS_FILES[virtual_path]
         return VIRTUAL_MOUNT_FILES.get(virtual_path) or VIRTUAL_PROC_FILES.get(
             virtual_path
         )
@@ -409,12 +420,17 @@ class VirtualRoot:
             content = self.render_mountinfo()
         elif kind == "filesystems":
             content = self.render_filesystems()
+        elif kind == "resolv.conf":
+            content = self.render_resolv_conf()
         else:
             content = self.render_mounts()
         fd, path = tempfile.mkstemp(prefix="pnfroot-mount-table-")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
         return path
+
+    def render_resolv_conf(self) -> str:
+        return "".join(f"nameserver {server}\n" for server in self.dns_servers)
 
     def render_mounts(self) -> str:
         lines = [

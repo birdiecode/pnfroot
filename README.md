@@ -269,8 +269,12 @@ CRI `PullImage` не принимает локальный rootfs-каталог
 ./ptrace_syscalls.py -- /bin/ls -la
 ./ptrace_syscalls.py --rootfs ./ubuntu_c -- /bin/bash
 ./ptrace_syscalls.py --rootfs ./ubuntu_c --uid 0 --gid 0 -- /bin/bash
+./ptrace_syscalls.py --rootfs ./ubuntu_c --dns-server 8.8.8.8 -- /usr/bin/apt-get update
 ./ptrace_syscalls.py --rootfs ./ubuntu_c --bind /tmp:/host-tmp -- /bin/ls /host-tmp
 ```
+
+`--dns-server` можно повторять. В `pnfroot.py` доступен тот же параметр; он
+виртуально подменяет `/etc/resolv.conf` для rootfs-контейнеров.
 
 ## Виртуальная сеть
 

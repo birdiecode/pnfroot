@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import errno
 import fcntl
+import ipaddress
 import os
 import platform
 import signal
@@ -386,6 +387,7 @@ def run_tracee(
     controlling_tty: bool = False,
     uid: int | None = None,
     gid: int | None = None,
+    dns_servers: list[str] | None = None,
     network_config: ContainerNetworkConfig | None = None,
     trace_logging: bool = False,
 ) -> int:
@@ -395,7 +397,7 @@ def run_tracee(
     cwd = normalize_virtual_path(cwd)
     TRACE_LOGGING = trace_logging
     ROOTFS = (
-        VirtualRoot(rootfs_path, binds=binds or [])
+        VirtualRoot(rootfs_path, binds=binds or [], dns_servers=dns_servers)
         if rootfs_path is not None
         else None
     )
@@ -625,6 +627,14 @@ def parse_bind_mount(value: str) -> BindMount:
     return BindMount.from_paths(host_path, virtual_path)
 
 
+def parse_dns_server(value: str) -> str:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid DNS server: {value}") from exc
+    return value
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Trace Linux syscalls with ptrace and follow fork/vfork/clone children."
@@ -680,6 +690,18 @@ def parse_args() -> argparse.Namespace:
         help="virtual gid visible to the traced process; defaults to --uid if set",
     )
     parser.add_argument(
+        "--dns",
+        "--dns-server",
+        action="append",
+        default=[],
+        type=parse_dns_server,
+        metavar="IP",
+        help=(
+            "override /etc/resolv.conf inside --rootfs with this DNS server; "
+            "repeatable"
+        ),
+    )
+    parser.add_argument(
         "--netdev",
         action="append",
         default=[],
@@ -730,6 +752,8 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--rootfs must be an existing directory: {args.rootfs}")
     elif args.bind:
         parser.error("--bind requires --rootfs")
+    elif args.dns:
+        parser.error("--dns-server requires --rootfs")
 
     args.cwd = normalize_virtual_path(args.cwd)
     if args.rootfs is None and args.cwd != "/":
@@ -784,6 +808,7 @@ def main() -> int:
         cwd=args.cwd,
         uid=args.uid,
         gid=args.gid,
+        dns_servers=args.dns,
         network_config=args.network_config,
         trace_logging=bool(args.verbose),
     )
