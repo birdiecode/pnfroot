@@ -61,7 +61,13 @@ from virtual_network import (
     parse_netdev,
     parse_publish,
 )
-from virtual_paths import BindMount, VirtualRoot, normalize_virtual_path, read_elf_interpreter
+from virtual_paths import (
+    BindMount,
+    VirtualRoot,
+    normalize_virtual_path,
+    read_elf_interpreter,
+    read_script_interpreter,
+)
 
 
 STRING_ARGS = {
@@ -288,24 +294,12 @@ def process_is_gone(exc: OSError) -> bool:
     return exc.errno == errno.ESRCH
 
 
-def read_script_interpreter(path: str) -> list[str] | None:
-    try:
-        with open(path, "rb") as handle:
-            line = handle.readline(256)
-    except OSError:
-        return None
-    if not line.startswith(b"#!"):
-        return None
-    text = os.fsdecode(line[2:].strip())
-    return text.split() or None
-
-
 def rootfs_exec_command(command: list[str], rootfs: VirtualRoot) -> list[str]:
     if not command or not command[0].startswith("/"):
         return command
 
     virtual_executable = normalize_virtual_path(command[0])
-    host_executable = rootfs.raw_host_path(virtual_executable)
+    host_executable = rootfs.host_path(virtual_executable)
 
     script_interpreter = read_script_interpreter(host_executable)
     if script_interpreter:
@@ -316,8 +310,8 @@ def rootfs_exec_command(command: list[str], rootfs: VirtualRoot) -> list[str]:
         return command
 
     elf_interpreter = read_elf_interpreter(host_executable)
-    if elf_interpreter and rootfs.should_use_direct_loader(host_executable):
-        host_interpreter = rootfs.raw_host_path(elf_interpreter)
+    if elf_interpreter:
+        host_interpreter = rootfs.host_path(elf_interpreter)
         if os.path.exists(host_interpreter):
             return [host_interpreter, "--argv0", command[0], host_executable, *command[1:]]
 

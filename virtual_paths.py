@@ -257,6 +257,18 @@ def read_elf_interpreter(path: str) -> str | None:
     return None
 
 
+def read_script_interpreter(path: str) -> list[str] | None:
+    try:
+        with open(path, "rb") as handle:
+            line = handle.readline(256)
+    except OSError:
+        return None
+    if not line.startswith(b"#!"):
+        return None
+    text = os.fsdecode(line[2:].strip())
+    return text.split() or None
+
+
 def escape_mount_field(value: str) -> str:
     return (
         value.replace("\\", "\\134")
@@ -347,13 +359,6 @@ class VirtualRoot:
         if virtual_path == "/":
             return self.root
         return os.path.join(self.root, *split_virtual_path(virtual_path))
-
-    def should_use_direct_loader(self, host_path: str) -> bool:
-        busybox_path = self.raw_host_path("/bin/busybox")
-        try:
-            return os.path.exists(busybox_path) and os.path.samefile(host_path, busybox_path)
-        except OSError:
-            return False
 
     def rootfs_host_path_to_virtual(self, host_path: str) -> str | None:
         root = os.path.realpath(self.root)
@@ -889,6 +894,28 @@ class VirtualRoot:
             return None
         return values
 
+    def dynamic_loader_argv(
+        self,
+        executable_host_path: str,
+        argv0: bytes,
+        argv_tail: list[bytes],
+    ) -> tuple[str, list[bytes]] | None:
+        interpreter = read_elf_interpreter(executable_host_path)
+        if not interpreter:
+            return None
+
+        host_interpreter = self.host_path(interpreter)
+        if not os.path.exists(host_interpreter):
+            return None
+
+        return host_interpreter, [
+            os.fsencode(host_interpreter),
+            b"--argv0",
+            argv0,
+            os.fsencode(executable_host_path),
+            *argv_tail,
+        ]
+
     def prepare_dynamic_exec(
         self,
         pid: int,
@@ -899,32 +926,53 @@ class VirtualRoot:
         scratch: TraceeScratch,
         regs: UserRegsStruct,
     ) -> tuple[str, str]:
-        interpreter = read_elf_interpreter(host_path)
-        if not interpreter or not self.should_use_direct_loader(host_path):
-            return host_path, host_path
-
-        host_interpreter = self.raw_host_path(interpreter)
-        if not os.path.exists(host_interpreter):
-            return host_path, host_path
-
         argv_index = 1 if name == "execve" else 2
         argv_values = self.read_string_array_bytes(pid, args[argv_index])
         if argv_values is None:
             return host_path, host_path
 
-        executable_host_path = self.raw_host_path(virtual_path)
         argv0 = argv_values[0] if argv_values else os.fsencode(virtual_path)
-        new_argv = [
-            os.fsencode(host_interpreter),
-            b"--argv0",
-            argv0,
-            os.fsencode(executable_host_path),
-            *argv_values[1:],
-        ]
+        script_interpreter = read_script_interpreter(host_path)
+        if script_interpreter:
+            interpreter = script_interpreter[0]
+            if not interpreter.startswith("/"):
+                return host_path, host_path
+
+            interpreter_virtual_path = normalize_virtual_path(interpreter)
+            interpreter_host_path = self.host_path(interpreter_virtual_path)
+            if not os.path.exists(interpreter_host_path):
+                return host_path, host_path
+
+            interpreter_argv = [
+                os.fsencode(interpreter_virtual_path),
+                *(os.fsencode(value) for value in script_interpreter[1:]),
+                os.fsencode(virtual_path),
+                *argv_values[1:],
+            ]
+            loader_argv = self.dynamic_loader_argv(
+                interpreter_host_path,
+                os.fsencode(interpreter_virtual_path),
+                interpreter_argv[1:],
+            )
+            if loader_argv is None:
+                syscall_host_path = interpreter_host_path
+                new_argv = interpreter_argv
+            else:
+                syscall_host_path, new_argv = loader_argv
+        else:
+            loader_argv = self.dynamic_loader_argv(
+                host_path,
+                argv0,
+                argv_values[1:],
+            )
+            if loader_argv is None:
+                return host_path, host_path
+            syscall_host_path, new_argv = loader_argv
+
         pointer_values = [scratch.write_c_string(value) for value in new_argv]
         argv_address = scratch.write_pointer_array([*pointer_values, 0])
         setattr(regs, ARG_REGISTERS[argv_index], argv_address)
-        return host_interpreter, executable_host_path
+        return syscall_host_path, host_path
 
     def rewrite_syscall_entry(
         self, pid: int, name: str, args: list[int], regs: UserRegsStruct
