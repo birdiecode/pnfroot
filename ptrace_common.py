@@ -48,10 +48,14 @@ WORD_SIZE = ctypes.sizeof(ctypes.c_void_p)
 
 
 def normalize_architecture(machine: str | None = None) -> str:
-    machine = (machine or platform.machine()).lower()
-    if machine in {"x86_64", "amd64"}:
+    machine = (machine or platform.machine()).lower().replace("-", "_")
+    if machine in {"x86_64", "amd64", "x64"}:
         return "x86_64"
-    if machine in {"aarch64", "arm64"}:
+    if (
+        machine in {"aarch64", "arm64", "arm64_v8a", "armv8l"}
+        or machine.startswith("aarch64_")
+        or machine.startswith("arm64_")
+    ):
         return "aarch64"
     return machine
 

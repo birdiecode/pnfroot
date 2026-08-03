@@ -19,13 +19,17 @@ from cri_common import logger, normalize_image_ref
 
 
 def default_image_platform(machine: str | None = None) -> str:
-    machine = (machine or host_platform.machine()).lower()
-    architecture = {
-        "x86_64": "amd64",
-        "amd64": "amd64",
-        "aarch64": "arm64",
-        "arm64": "arm64",
-    }.get(machine)
+    machine = (machine or host_platform.machine()).lower().replace("-", "_")
+    if machine in {"x86_64", "amd64", "x64"}:
+        architecture = "amd64"
+    elif (
+        machine in {"aarch64", "arm64", "arm64_v8a", "armv8l"}
+        or machine.startswith("aarch64_")
+        or machine.startswith("arm64_")
+    ):
+        architecture = "arm64"
+    else:
+        architecture = None
     if architecture is None:
         raise RuntimeError(f"unsupported host architecture: {machine}")
     return f"linux/{architecture}"

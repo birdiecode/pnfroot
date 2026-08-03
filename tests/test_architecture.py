@@ -1,5 +1,6 @@
 import ctypes
 
+import ptrace_syscalls
 from image_store import default_image_platform
 from ptrace_common import (
     AArch64UserRegsStruct,
@@ -14,11 +15,24 @@ def test_normalizes_supported_architecture_names() -> None:
     assert normalize_architecture("x86_64") == "x86_64"
     assert normalize_architecture("arm64") == "aarch64"
     assert normalize_architecture("aarch64") == "aarch64"
+    assert normalize_architecture("arm64-v8a") == "aarch64"
+    assert normalize_architecture("armv8l") == "aarch64"
 
 
 def test_default_image_platform_follows_host_architecture() -> None:
     assert default_image_platform("x86_64") == "linux/amd64"
     assert default_image_platform("aarch64") == "linux/arm64"
+    assert default_image_platform("arm64-v8a") == "linux/arm64"
+    assert default_image_platform("armv8l") == "linux/arm64"
+
+
+def test_android_aarch64_is_supported(monkeypatch) -> None:
+    monkeypatch.setattr(ptrace_syscalls.platform, "system", lambda: "Android")
+    monkeypatch.setattr(ptrace_syscalls.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(ptrace_syscalls, "ARCHITECTURE", "aarch64")
+    monkeypatch.setattr(ptrace_syscalls, "WORD_SIZE", 8)
+
+    ptrace_syscalls.ensure_supported_architecture()
 
 
 def test_aarch64_register_aliases_match_syscall_abi() -> None:

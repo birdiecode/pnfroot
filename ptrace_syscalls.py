@@ -788,13 +788,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def ensure_supported_architecture() -> None:
+    operating_system = platform.system()
     if (
-        platform.system() != "Linux"
+        operating_system not in {"Linux", "Android"}
         or ARCHITECTURE not in SUPPORTED_ARCHITECTURES
         or WORD_SIZE != 8
     ):
         raise SystemExit(
-            "This tracer supports only native 64-bit Linux x86_64 and arm64 processes."
+            "This tracer supports only native 64-bit Linux/Android x86_64 and "
+            f"arm64 processes (system={operating_system!r}, "
+            f"machine={platform.machine()!r}, word_size={WORD_SIZE})."
         )
 
 
