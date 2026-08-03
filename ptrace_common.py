@@ -6,6 +6,7 @@ import ctypes
 import ctypes.util
 import errno
 import os
+import platform
 import re
 import signal
 import sys
@@ -21,6 +22,11 @@ PTRACE_SYSCALL = 24
 PTRACE_DETACH = 17
 PTRACE_SETOPTIONS = 0x4200
 PTRACE_GETEVENTMSG = 0x4201
+PTRACE_GETREGSET = 0x4204
+PTRACE_SETREGSET = 0x4205
+
+NT_PRSTATUS = 1
+NT_ARM_SYSTEM_CALL = 0x404
 
 PTRACE_O_TRACESYSGOOD = 0x00000001
 PTRACE_O_TRACEFORK = 0x00000002
@@ -39,6 +45,19 @@ PTRACE_EVENT_EXIT = 6
 WAIT_ALL_TRACED = 0x40000000  # __WALL: wait for traced threads too.
 SYSCALL_STOP = signal.SIGTRAP | 0x80
 WORD_SIZE = ctypes.sizeof(ctypes.c_void_p)
+
+
+def normalize_architecture(machine: str | None = None) -> str:
+    machine = (machine or platform.machine()).lower()
+    if machine in {"x86_64", "amd64"}:
+        return "x86_64"
+    if machine in {"aarch64", "arm64"}:
+        return "aarch64"
+    return machine
+
+
+ARCHITECTURE = normalize_architecture()
+SUPPORTED_ARCHITECTURES = {"x86_64", "aarch64"}
 ARG_REGISTERS = ("rdi", "rsi", "rdx", "r10", "r8", "r9")
 
 TRACE_OPTIONS = (
@@ -52,7 +71,7 @@ TRACE_OPTIONS = (
 )
 
 
-class UserRegsStruct(ctypes.Structure):
+class X86_64UserRegsStruct(ctypes.Structure):
     _fields_ = [
         ("r15", ctypes.c_ulonglong),
         ("r14", ctypes.c_ulonglong),
@@ -82,6 +101,76 @@ class UserRegsStruct(ctypes.Structure):
         ("fs", ctypes.c_ulonglong),
         ("gs", ctypes.c_ulonglong),
     ]
+
+
+class AArch64UserRegsStruct(ctypes.Structure):
+    """Linux arm64 ``struct user_pt_regs`` with neutral ABI accessors."""
+
+    _fields_ = [
+        ("regs", ctypes.c_ulonglong * 31),
+        ("sp", ctypes.c_ulonglong),
+        ("pc", ctypes.c_ulonglong),
+        ("pstate", ctypes.c_ulonglong),
+    ]
+
+    def _get_register(self, index: int) -> int:
+        return int(self.regs[index])
+
+    def _set_register(self, index: int, value: int) -> None:
+        self.regs[index] = ctypes.c_ulonglong(value).value
+
+    # These aliases let the architecture-independent rewriting code continue
+    # to address syscall arguments 0..5 and the return value uniformly.
+    rdi = property(
+        lambda self: self._get_register(0),
+        lambda self, value: self._set_register(0, value),
+    )
+    rsi = property(
+        lambda self: self._get_register(1),
+        lambda self, value: self._set_register(1, value),
+    )
+    rdx = property(
+        lambda self: self._get_register(2),
+        lambda self, value: self._set_register(2, value),
+    )
+    r10 = property(
+        lambda self: self._get_register(3),
+        lambda self, value: self._set_register(3, value),
+    )
+    r8 = property(
+        lambda self: self._get_register(4),
+        lambda self, value: self._set_register(4, value),
+    )
+    r9 = property(
+        lambda self: self._get_register(5),
+        lambda self, value: self._set_register(5, value),
+    )
+    rax = property(
+        lambda self: self._get_register(0),
+        lambda self, value: self._set_register(0, value),
+    )
+    rsp = property(
+        lambda self: int(self.sp),
+        lambda self, value: setattr(self, "sp", value),
+    )
+
+    @property
+    def orig_rax(self) -> int:
+        return int(getattr(self, "_syscall_number", self.regs[8]))
+
+    @orig_rax.setter
+    def orig_rax(self, value: int) -> None:
+        self._syscall_number = int(value)
+        self.regs[8] = ctypes.c_ulonglong(value).value
+
+
+UserRegsStruct = (
+    AArch64UserRegsStruct if ARCHITECTURE == "aarch64" else X86_64UserRegsStruct
+)
+
+
+class IOVec(ctypes.Structure):
+    _fields_ = [("iov_base", ctypes.c_void_p), ("iov_len", ctypes.c_size_t)]
 
 
 @dataclass
@@ -179,12 +268,41 @@ def set_trace_options(pid: int) -> None:
 
 def get_regs(pid: int) -> UserRegsStruct:
     regs = UserRegsStruct()
-    ptrace(PTRACE_GETREGS, pid, 0, ctypes.byref(regs))
+    if ARCHITECTURE == "aarch64":
+        iov = IOVec(ctypes.addressof(regs), ctypes.sizeof(regs))
+        ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, ctypes.byref(iov))
+        syscall_number = ctypes.c_int()
+        syscall_iov = IOVec(
+            ctypes.addressof(syscall_number), ctypes.sizeof(syscall_number)
+        )
+        ptrace(
+            PTRACE_GETREGSET,
+            pid,
+            NT_ARM_SYSTEM_CALL,
+            ctypes.byref(syscall_iov),
+        )
+        regs.orig_rax = syscall_number.value
+    else:
+        ptrace(PTRACE_GETREGS, pid, 0, ctypes.byref(regs))
     return regs
 
 
 def set_regs(pid: int, regs: UserRegsStruct) -> None:
-    ptrace(PTRACE_SETREGS, pid, 0, ctypes.byref(regs))
+    if ARCHITECTURE == "aarch64":
+        iov = IOVec(ctypes.addressof(regs), ctypes.sizeof(regs))
+        ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, ctypes.byref(iov))
+        syscall_number = ctypes.c_int(int(regs.orig_rax))
+        syscall_iov = IOVec(
+            ctypes.addressof(syscall_number), ctypes.sizeof(syscall_number)
+        )
+        ptrace(
+            PTRACE_SETREGSET,
+            pid,
+            NT_ARM_SYSTEM_CALL,
+            ctypes.byref(syscall_iov),
+        )
+    else:
+        ptrace(PTRACE_SETREGS, pid, 0, ctypes.byref(regs))
 
 
 def get_event_msg(pid: int) -> int:
@@ -193,28 +311,80 @@ def get_event_msg(pid: int) -> int:
     return int(msg.value)
 
 
-def load_syscall_names() -> dict[int, str]:
-    names: dict[int, str] = {}
-    header_paths = [
-        "/usr/include/x86_64-linux-gnu/asm/unistd_64.h",
-        "/usr/include/asm/unistd_64.h",
-        "/usr/include/asm-generic/unistd.h",
-    ]
-    pattern = re.compile(r"^#define\s+__NR_([A-Za-z0-9_]+)\s+(\d+)\b")
-
-    for path in header_paths:
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as header:
-                for line in header:
-                    match = pattern.match(line)
-                    if match:
-                        names[int(match.group(2))] = match.group(1)
-        except OSError:
-            continue
-
-        if names:
-            return names
-
+def fallback_syscall_names(architecture: str) -> dict[int, str]:
+    if architecture == "aarch64":
+        return {
+            17: "getcwd",
+            23: "dup",
+            24: "dup3",
+            25: "fcntl",
+            29: "ioctl",
+            33: "mknodat",
+            34: "mkdirat",
+            35: "unlinkat",
+            36: "symlinkat",
+            37: "linkat",
+            38: "renameat",
+            39: "umount2",
+            40: "mount",
+            45: "truncate",
+            48: "faccessat",
+            49: "chdir",
+            54: "fchownat",
+            55: "fchown",
+            56: "openat",
+            57: "close",
+            63: "read",
+            64: "write",
+            78: "readlinkat",
+            79: "newfstatat",
+            80: "fstat",
+            88: "utimensat",
+            93: "exit",
+            94: "exit_group",
+            143: "setregid",
+            144: "setgid",
+            145: "setreuid",
+            146: "setuid",
+            147: "setresuid",
+            148: "getresuid",
+            149: "setresgid",
+            150: "getresgid",
+            151: "setfsuid",
+            152: "setfsgid",
+            158: "getgroups",
+            159: "setgroups",
+            172: "getpid",
+            174: "getuid",
+            175: "geteuid",
+            176: "getgid",
+            177: "getegid",
+            198: "socket",
+            199: "socketpair",
+            200: "bind",
+            201: "listen",
+            202: "accept",
+            203: "connect",
+            204: "getsockname",
+            205: "getpeername",
+            206: "sendto",
+            207: "recvfrom",
+            208: "setsockopt",
+            209: "getsockopt",
+            210: "shutdown",
+            211: "sendmsg",
+            212: "recvmsg",
+            220: "clone",
+            221: "execve",
+            222: "mmap",
+            242: "accept4",
+            276: "renameat2",
+            281: "execveat",
+            291: "statx",
+            293: "rseq",
+            436: "close_range",
+            439: "faccessat2",
+        }
     return {
         0: "read",
         1: "write",
@@ -238,6 +408,62 @@ def load_syscall_names() -> dict[int, str]:
         257: "openat",
         262: "newfstatat",
     }
+
+
+def load_syscall_names(architecture: str | None = None) -> dict[int, str]:
+    architecture = architecture or ARCHITECTURE
+    names: dict[int, str] = {}
+    if architecture == "aarch64":
+        header_paths = [
+            "/usr/include/aarch64-linux-gnu/asm/unistd.h",
+            "/usr/include/asm/unistd.h",
+            "/usr/include/asm-generic/unistd.h",
+        ]
+    else:
+        header_paths = [
+            "/usr/include/x86_64-linux-gnu/asm/unistd_64.h",
+            "/usr/include/asm/unistd_64.h",
+        ]
+    pattern = re.compile(
+        r"^#define\s+__NR(3264)?_([A-Za-z0-9_]+)\s+(\d+)\b"
+    )
+
+    for path in header_paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as header:
+                for line in header:
+                    match = pattern.match(line)
+                    if match:
+                        prefix = "3264_" if match.group(1) else ""
+                        names[int(match.group(3))] = prefix + match.group(2)
+        except OSError:
+            continue
+
+        if names:
+            break
+
+    if architecture == "aarch64":
+        generic_aliases = {
+            "3264_fcntl": "fcntl",
+            "3264_fstatat": "newfstatat",
+            "3264_fstat": "fstat",
+            "3264_lseek": "lseek",
+            "3264_mmap": "mmap",
+            "3264_statfs": "statfs",
+            "3264_fstatfs": "fstatfs",
+            "3264_truncate": "truncate",
+            "3264_ftruncate": "ftruncate",
+            "3264_sendfile": "sendfile",
+            "3264_fadvise64": "fadvise64",
+        }
+        names = {
+            number: generic_aliases.get(name, name)
+            for number, name in names.items()
+        }
+
+    fallback = fallback_syscall_names(architecture)
+    fallback.update(names)
+    return fallback
 
 
 SYSCALL_NAMES = load_syscall_names()

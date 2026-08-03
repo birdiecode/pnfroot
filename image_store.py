@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import os
+import platform as host_platform
 import re
 import shutil
 import tarfile
@@ -17,7 +18,20 @@ from urllib.request import Request, urlopen
 from cri_common import logger, normalize_image_ref
 
 
-IMAGE_PLATFORM = "linux/amd64"
+def default_image_platform(machine: str | None = None) -> str:
+    machine = (machine or host_platform.machine()).lower()
+    architecture = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(machine)
+    if architecture is None:
+        raise RuntimeError(f"unsupported host architecture: {machine}")
+    return f"linux/{architecture}"
+
+
+IMAGE_PLATFORM = default_image_platform()
 DEFAULT_IMAGE_SIZE = 1
 IMAGE_METADATA_FILE = "pnfroot-image.json"
 REGISTRY_MANIFEST_ACCEPT = ", ".join(

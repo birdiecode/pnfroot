@@ -8,8 +8,8 @@ Usage examples:
     ./ptrace_syscalls.py --rootfs ./ubuntu_c --bind /tmp:/host-tmp -- /bin/ls /host-tmp
     ./ptrace_syscalls.py --netdev name=eth0,network=backend --netservice /tmp/net.unix -- /bin/bash
 
-This script is intentionally dependency-free. It currently supports Linux
-x86_64, where syscall arguments live in rdi, rsi, rdx, r10, r8, r9.
+This script is intentionally dependency-free. It supports native Linux x86_64
+and arm64 tracees.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import termios
 from collections.abc import Callable
 
 from ptrace_common import (
+    ARCHITECTURE,
     PTRACE_DETACH,
     PTRACE_EVENT_CLONE,
     PTRACE_EVENT_EXEC,
@@ -37,6 +38,7 @@ from ptrace_common import (
     SYSCALL_NAMES,
     SYSCALL_NUMBERS,
     SYSCALL_STOP,
+    SUPPORTED_ARCHITECTURES,
     WAIT_ALL_TRACED,
     WORD_SIZE,
     SyscallContext,
@@ -786,10 +788,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def ensure_supported_architecture() -> None:
-    machine = platform.machine().lower()
-    if machine not in {"x86_64", "amd64"} or WORD_SIZE != 8:
+    if (
+        platform.system() != "Linux"
+        or ARCHITECTURE not in SUPPORTED_ARCHITECTURES
+        or WORD_SIZE != 8
+    ):
         raise SystemExit(
-            "This tracer currently supports only Linux x86_64 processes."
+            "This tracer supports only native 64-bit Linux x86_64 and arm64 processes."
         )
 
 

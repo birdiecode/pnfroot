@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import logging
+import platform as host_platform
 from pathlib import Path
 
 import requests
@@ -20,6 +21,17 @@ ACCEPT_MANIFEST = ", ".join([
 
 
 logger = logging.getLogger(__name__)
+
+
+def default_platform() -> str:
+    machine = host_platform.machine().lower()
+    architecture = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(machine, machine)
+    return f"linux/{architecture}"
 
 
 def parse_image(image: str):
@@ -112,7 +124,7 @@ def download_blob(repo: str, digest: str, token: str, out_path: Path):
 def pull_image(
     image: str,
     output: str | None = None,
-    platform: str = "linux/amd64",
+    platform: str | None = None,
 ) -> Path:
     """
     Скачивает Docker/OCI образ из Docker Hub.
@@ -128,6 +140,7 @@ def pull_image(
 
     repo, tag = parse_image(image)
 
+    platform = platform or default_platform()
     platform_os, platform_arch = platform.split("/", 1)
 
     out_dir = Path(output or image.replace("/", "_").replace(":", "_"))
@@ -215,7 +228,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("image", help="например: alpine:latest, ubuntu:24.04")
     parser.add_argument("-o", "--output", default=None)
-    parser.add_argument("--platform", default="linux/amd64")
+    parser.add_argument("--platform", default=default_platform())
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
