@@ -320,6 +320,18 @@ def rootfs_exec_command(command: list[str], rootfs: VirtualRoot) -> list[str]:
     return command
 
 
+def sanitize_tracee_environment(
+    env: dict[str, str], operating_system: str | None = None
+) -> dict[str, str]:
+    """Remove Android linker state which is incompatible with glibc rootfses."""
+    clean_env = dict(env)
+    if (operating_system or platform.system()) == "Android":
+        clean_env.pop("LD_PRELOAD", None)
+        clean_env.pop("LD_LIBRARY_PATH", None)
+        clean_env.pop("TERMUX_EXEC__PROC_SELF_EXE", None)
+    return clean_env
+
+
 def launch_tracee(
     command: list[str],
     rootfs: VirtualRoot | None = None,
@@ -338,6 +350,7 @@ def launch_tracee(
             if rootfs is not None:
                 os.chdir(rootfs.raw_host_path(cwd))
                 child_env["PWD"] = cwd
+                child_env = sanitize_tracee_environment(child_env)
                 exec_command = rootfs_exec_command(command, rootfs)
 
             if controlling_tty:

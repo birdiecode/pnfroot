@@ -35,6 +35,20 @@ def test_android_aarch64_is_supported(monkeypatch) -> None:
     ptrace_syscalls.ensure_supported_architecture()
 
 
+def test_android_tracee_environment_drops_termux_linker_state() -> None:
+    env = {
+        "PATH": "/data/data/com.termux/files/usr/bin",
+        "LD_PRELOAD": "/data/data/com.termux/files/usr/lib/libtermux-exec.so",
+        "LD_LIBRARY_PATH": "/data/data/com.termux/files/usr/lib",
+        "TERMUX_EXEC__PROC_SELF_EXE": "/data/data/com.termux/files/usr/bin/python",
+    }
+
+    clean_env = ptrace_syscalls.sanitize_tracee_environment(env, "Android")
+
+    assert clean_env == {"PATH": env["PATH"]}
+    assert "LD_PRELOAD" in env
+
+
 def test_aarch64_register_aliases_match_syscall_abi() -> None:
     regs = AArch64UserRegsStruct()
     regs.rdi = 10
