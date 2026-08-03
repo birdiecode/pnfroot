@@ -15,6 +15,7 @@ and arm64 tracees.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import fcntl
 import ipaddress
@@ -46,6 +47,7 @@ from ptrace_common import (
     get_event_msg,
     get_regs,
     hex_or_null,
+    libc,
     ptrace,
     read_c_string,
     read_string_array,
@@ -332,6 +334,71 @@ def sanitize_tracee_environment(
     return clean_env
 
 
+def copy_executable_to_memfd(path: str) -> int:
+    """Copy an app-data ELF to anonymous memory for Android W^X execution."""
+    if not hasattr(os, "memfd_create"):
+        raise OSError(errno.ENOSYS, "memfd_create is unavailable")
+    try:
+        # New Android kernels can default memfds to non-executable and require
+        # the Linux 6.3 MFD_EXEC flag explicitly. Older kernels reject it.
+        memfd = os.memfd_create(
+            "pnfroot-exec", flags=getattr(os, "MFD_EXEC", 0x0010)
+        )
+    except OSError as exc:
+        if exc.errno != errno.EINVAL:
+            raise
+        memfd = os.memfd_create("pnfroot-exec", flags=0)
+    try:
+        source_fd = os.open(path, os.O_RDONLY)
+        try:
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(memfd, view)
+                    view = view[written:]
+        finally:
+            os.close(source_fd)
+        os.fchmod(memfd, 0o700)
+        os.lseek(memfd, 0, os.SEEK_SET)
+        return memfd
+    except BaseException:
+        os.close(memfd)
+        raise
+
+
+def execveat_memfd(path: str, argv: list[str], env: dict[str, str]) -> None:
+    """Execute an ELF from memfd using the raw syscall, bypassing termux-exec."""
+    syscall_number = SYSCALL_NUMBERS.get("execveat")
+    if syscall_number is None:
+        raise OSError(errno.ENOSYS, "execveat syscall number is unavailable")
+
+    memfd = copy_executable_to_memfd(path)
+    argv_bytes = [os.fsencode(value) for value in argv]
+    env_bytes = [os.fsencode(f"{key}={value}") for key, value in env.items()]
+    argv_array = (ctypes.c_char_p * (len(argv_bytes) + 1))(
+        *argv_bytes, None
+    )
+    env_array = (ctypes.c_char_p * (len(env_bytes) + 1))(*env_bytes, None)
+
+    ctypes.set_errno(0)
+    result = libc.syscall(
+        ctypes.c_long(syscall_number),
+        ctypes.c_int(memfd),
+        ctypes.c_char_p(b""),
+        ctypes.cast(argv_array, ctypes.c_void_p),
+        ctypes.cast(env_array, ctypes.c_void_p),
+        ctypes.c_int(0x1000),  # AT_EMPTY_PATH
+    )
+    err = ctypes.get_errno() or errno.EIO
+    os.close(memfd)
+    if result == -1:
+        raise OSError(err, os.strerror(err), path)
+    raise OSError(errno.EIO, "execveat unexpectedly returned", path)
+
+
 def launch_tracee(
     command: list[str],
     rootfs: VirtualRoot | None = None,
@@ -375,7 +442,10 @@ def launch_tracee(
 
             ptrace(PTRACE_TRACEME, 0, 0, 0)
             os.kill(os.getpid(), signal.SIGSTOP)
-            os.execvpe(exec_command[0], exec_command, child_env)
+            if rootfs is not None and platform.system() == "Android":
+                execveat_memfd(exec_command[0], exec_command, child_env)
+            else:
+                os.execvpe(exec_command[0], exec_command, child_env)
         except OSError as exc:
             os.write(2, f"exec failed: {exc}\n".encode("utf-8"))
             os._exit(127)

@@ -1,4 +1,5 @@
 import ctypes
+import os
 
 import ptrace_syscalls
 from image_store import default_image_platform
@@ -47,6 +48,18 @@ def test_android_tracee_environment_drops_termux_linker_state() -> None:
 
     assert clean_env == {"PATH": env["PATH"]}
     assert "LD_PRELOAD" in env
+
+
+def test_copies_android_loader_to_memfd(tmp_path) -> None:
+    loader = tmp_path / "ld-linux-aarch64.so.1"
+    loader.write_bytes(b"\x7fELFtest-loader")
+
+    fd = ptrace_syscalls.copy_executable_to_memfd(str(loader))
+    try:
+        assert os.read(fd, 64) == b"\x7fELFtest-loader"
+        assert os.fstat(fd).st_mode & 0o700 == 0o700
+    finally:
+        os.close(fd)
 
 
 def test_aarch64_register_aliases_match_syscall_abi() -> None:
