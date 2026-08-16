@@ -1,0 +1,18 @@
+{
+  "metadata": {
+    "name": "nginx",
+    "uid": "nginx-standalone",
+    "namespace": "default",
+    "attempt": 1
+  },
+  "log_directory": "/data/data/com.termux/files/home/pnf-state/logs",
+  "port_mappings": [
+    {
+      "protocol": 0,
+      "container_port": 80,
+      "host_port": 8080,
+      "host_ip": "127.0.0.1"
+    }
+  ],
+  "linux": {}
+}

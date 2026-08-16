@@ -58,6 +58,7 @@ from virtual_network import (
     ContainerNetworkConfig,
     NetworkServiceClient,
     NetworkServiceError,
+    PublishedPort,
     VirtualNetworkInterface,
 )
 # Compatibility re-exports for CRI streaming constants/classes.
@@ -490,6 +491,17 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             container_id=str(network.get("container_id") or sandbox["id"]),
             interfaces=[interface],
             service_socket=str(service_socket),
+            published_ports=[
+                PublishedPort(
+                    host_ip=str(mapping.get("host_ip") or "0.0.0.0"),
+                    host_port=int(mapping["host_port"]),
+                    container_port=int(mapping["container_port"]),
+                    protocol=str(mapping.get("protocol") or "tcp"),
+                )
+                for mapping in sandbox.get("port_mappings", [])
+                if int(mapping.get("host_port") or 0) > 0
+                and int(mapping.get("container_port") or 0) > 0
+            ],
         )
 
     def sandbox_to_state(self, sandbox: dict[str, Any]) -> dict[str, Any]:
@@ -502,6 +514,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "annotations": dict(sandbox.get("annotations") or {}),
             "runtime_handler": sandbox.get("runtime_handler") or "",
             "network": dict(sandbox.get("network") or {}),
+            "port_mappings": list(sandbox.get("port_mappings") or []),
         }
 
     def sandbox_from_state(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -515,6 +528,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "annotations": dict(data.get("annotations") or {}),
             "runtime_handler": data.get("runtime_handler") or "",
             "network": dict(data.get("network") or {}),
+            "port_mappings": list(data.get("port_mappings") or []),
         }
 
     def container_to_state(self, container: dict[str, Any]) -> dict[str, Any]:
@@ -1328,6 +1342,16 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "annotations": request.config.annotations,
             "runtime_handler": request.runtime_handler,
             "network": network,
+            "port_mappings": [
+                {
+                    "host_ip": mapping.host_ip or "0.0.0.0",
+                    "host_port": int(mapping.host_port),
+                    "container_port": int(mapping.container_port),
+                    "protocol": "tcp",
+                }
+                for mapping in request.config.port_mappings
+                if mapping.protocol == api_pb2.TCP
+            ],
         }
         self.save_runtime_state()
         return api_pb2.RunPodSandboxResponse(pod_sandbox_id=pod_id)

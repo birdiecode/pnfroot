@@ -1,0 +1,20 @@
+{
+  "metadata": {
+    "name": "nginx",
+    "attempt": 1
+  },
+  "image": {
+    "image": "nginx:latest"
+  },
+  "command": [
+    "/usr/sbin/nginx"
+  ],
+  "args": [
+    "-g",
+    "daemon off;"
+  ],
+  "log_path": "nginx.log",
+  "linux": {
+    "resources": {}
+  }
+}

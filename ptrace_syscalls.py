@@ -23,6 +23,7 @@ import os
 import platform
 import signal
 import sys
+import tempfile
 import termios
 from collections.abc import Callable
 
@@ -214,7 +215,9 @@ def syscall_entry(pid: int) -> SyscallRecord:
         int(regs.r9),
     ]
     metadata: dict[str, object] = {}
-    if name == "rseq":
+    if name == "rseq" or (
+        name == "set_robust_list" and platform.system() == "Android"
+    ):
         regs.orig_rax = NOOP_SYSCALL_NUMBER
         set_regs(pid, regs)
         metadata["forced_result"] = -errno.ENOSYS
@@ -336,18 +339,41 @@ def sanitize_tracee_environment(
 
 def copy_executable_to_memfd(path: str) -> int:
     """Copy an app-data ELF to anonymous memory for Android W^X execution."""
-    if not hasattr(os, "memfd_create"):
-        raise OSError(errno.ENOSYS, "memfd_create is unavailable")
-    try:
-        # New Android kernels can default memfds to non-executable and require
-        # the Linux 6.3 MFD_EXEC flag explicitly. Older kernels reject it.
-        memfd = os.memfd_create(
-            "pnfroot-exec", flags=getattr(os, "MFD_EXEC", 0x0010)
+    def create_memfd(flags: int) -> int:
+        if hasattr(os, "memfd_create"):
+            return os.memfd_create("pnfroot-exec", flags=flags)
+        syscall_number = SYSCALL_NUMBERS.get("memfd_create")
+        if syscall_number is None and platform.machine().lower() in {
+            "aarch64", "arm64", "arm64_v8a", "armv8l"
+        }:
+            syscall_number = 279
+        if syscall_number is None:
+            raise OSError(errno.ENOSYS, "memfd_create syscall is unavailable")
+        ctypes.set_errno(0)
+        result = libc.syscall(
+            ctypes.c_long(syscall_number),
+            ctypes.c_char_p(b"pnfroot-exec"),
+            ctypes.c_uint(flags),
         )
+        if result == -1:
+            err = ctypes.get_errno() or errno.EIO
+            raise OSError(err, os.strerror(err))
+        return int(result)
+    disk_backed = not hasattr(os, "memfd_create")
+    temp_path: str | None = None
+    try:
+        if disk_backed:
+            temp_dir = os.path.join(os.environ.get("PREFIX", tempfile.gettempdir()), "tmp")
+            os.makedirs(temp_dir, exist_ok=True)
+            memfd, temp_path = tempfile.mkstemp(prefix="pnfroot-exec-", dir=temp_dir)
+        else:
+            # New Android kernels can default memfds to non-executable and require
+            # the Linux 6.3 MFD_EXEC flag explicitly. Older kernels reject it.
+            memfd = create_memfd(getattr(os, "MFD_EXEC", 0x0010))
     except OSError as exc:
         if exc.errno != errno.EINVAL:
             raise
-        memfd = os.memfd_create("pnfroot-exec", flags=0)
+        memfd = create_memfd(0)
     try:
         source_fd = os.open(path, os.O_RDONLY)
         try:
@@ -361,11 +387,24 @@ def copy_executable_to_memfd(path: str) -> int:
                     view = view[written:]
         finally:
             os.close(source_fd)
-        os.fchmod(memfd, 0o700)
+        # Android's anonymous memfd fallback is already created as 0777 and
+        # SELinux rejects chmod on it after executable data was written.
+        if disk_backed or not os.fstat(memfd).st_mode & 0o111:
+            os.fchmod(memfd, 0o700)
+        if disk_backed and temp_path is not None:
+            exec_fd = os.open(temp_path, os.O_RDONLY)
+            os.unlink(temp_path)
+            os.close(memfd)
+            memfd = exec_fd
         os.lseek(memfd, 0, os.SEEK_SET)
         return memfd
     except BaseException:
         os.close(memfd)
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
         raise
 
 

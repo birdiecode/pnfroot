@@ -346,6 +346,7 @@ def fallback_syscall_names(architecture: str) -> dict[int, str]:
             88: "utimensat",
             93: "exit",
             94: "exit_group",
+            99: "set_robust_list",
             143: "setregid",
             144: "setgid",
             145: "setreuid",
