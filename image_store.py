@@ -10,6 +10,7 @@ import shutil
 import tarfile
 import time
 import uuid
+import stat
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
@@ -413,10 +414,7 @@ def extract_tar_safe(layer_path: Path, rootfs_path: Path) -> None:
             pure_name = PurePosixPath(name)
             if pure_name.is_absolute() or ".." in pure_name.parts:
                 raise ValueError(f"unsafe image layer path: {member.name}")
-            # Keep the archive path lexical for all entry types. Resolving a
-            # parent symlink (notably usr/bin/cmp in Debian layers) makes a
-            # valid in-root entry appear to escape the rootfs.
-            target = rootfs / name
+            target = _resolve_rootfs_path(rootfs, name)
             if target != rootfs and rootfs not in target.parents:
                 raise ValueError(f"unsafe image layer path: {member.name}")
 
@@ -439,4 +437,41 @@ def extract_tar_safe(layer_path: Path, rootfs_path: Path) -> None:
                         victim.unlink(missing_ok=True)
                 continue
 
-            archive.extract(member, rootfs, filter="fully_trusted")
+            parent.mkdir(parents=True, exist_ok=True)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if member.issym():
+                target.unlink(missing_ok=True)
+                os.symlink(member.linkname, target)
+                continue
+            if member.islnk():
+                link_target = _resolve_rootfs_path(rootfs, member.linkname)
+                target.unlink(missing_ok=True)
+                os.link(link_target, target)
+                continue
+            source = archive.extractfile(member)
+            if source is None:
+                continue
+            target.unlink(missing_ok=True)
+            with open(target, "wb") as output:
+                shutil.copyfileobj(source, output)
+            mode = member.mode & 0o7777
+            os.chmod(target, mode)
+
+
+def _resolve_rootfs_path(rootfs: Path, name: str) -> Path:
+    """Resolve existing symlink components without leaving the rootfs."""
+    current = rootfs
+    for component in PurePosixPath(name).parts:
+        if component in ("", "."):
+            continue
+        if component == "..":
+            raise ValueError(f"unsafe image layer path: {name}")
+        candidate = current / component
+        if candidate.is_symlink():
+            link = os.readlink(candidate)
+            current = rootfs / link.lstrip("/") if link.startswith("/") else candidate.parent / link
+        else:
+            current = candidate
+    return current
