@@ -79,6 +79,7 @@ STRING_ARGS = {
     "open": {0},
     "creat": {0},
     "access": {0},
+    "faccessat2": {1},
     "stat": {0},
     "lstat": {0},
     "newstat": {0},
