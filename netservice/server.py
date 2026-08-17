@@ -423,13 +423,22 @@ class VirtualNetworkService:
             mapping = self.registry.find_mapping(container_id, container_port, protocol)
             if mapping is not None and rule.key() not in self.active_publishes:
                 forwarder_id = f"pub-{container_id}-{host_ip}-{host_port}-{container_port}"
-                forwarder, address = self.proxy_manager.create_forwarder(
-                    forwarder_id=forwarder_id,
-                    listen_host=host_ip,
-                    listen_port=host_port,
-                    target_host=mapping.real_ip,
-                    target_port=mapping.real_port,
-                )
+                try:
+                    forwarder, address = self.proxy_manager.create_forwarder(
+                        forwarder_id=forwarder_id,
+                        listen_host=host_ip,
+                        listen_port=host_port,
+                        target_host=mapping.real_ip,
+                        target_port=mapping.real_port,
+                    )
+                except OSError as exc:
+                    rules.remove(rule)
+                    errno_name = errno.errorcode.get(
+                        exc.errno or errno.EADDRINUSE, "EADDRINUSE"
+                    )
+                    raise RegistryError(
+                        f"host port publish failed: {exc}", errno_name
+                    ) from exc
                 self.active_publishes[rule.key()] = ActivePublish(
                     rule=rule, mapping=mapping, forwarder=forwarder
                 )

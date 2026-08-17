@@ -327,6 +327,58 @@ class NetserviceIntegrationTests(unittest.TestCase):
                 poke_unix_socket(socket_path)
                 service_thread.join(timeout=2)
 
+    def test_releases_published_listener_before_container_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "net.unix")
+            host_port = reserve_local_port()
+            service = VirtualNetworkService(socket_path, quiet=True)
+            service_thread = threading.Thread(target=service.serve_forever)
+            service_thread.daemon = True
+            service_thread.start()
+            wait_for_path(socket_path)
+
+            client = NetworkServiceClient(socket_path)
+            config = ContainerNetworkConfig(
+                container_id="web-restart",
+                service_socket=socket_path,
+                interfaces=[
+                    VirtualNetworkInterface(
+                        name="eth0",
+                        network="testnet",
+                        ip_address="10.50.0.31",
+                        prefix_length=24,
+                    )
+                ],
+                published_ports=[
+                    PublishedPort(
+                        host_ip="127.0.0.1",
+                        host_port=host_port,
+                        container_port=8080,
+                    )
+                ],
+            )
+            try:
+                client.allocate_container(config)
+                client.register_container(config, 1003)
+                bind_published_port(client, "web-restart", 1003, "10.50.0.31", 8080)
+
+                client.unregister_container("web-restart", 1003)
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind(("127.0.0.1", host_port))
+
+                config.published_ports = []
+                client.register_container(config, 1004)
+                response = bind_published_port(
+                    client, "web-restart", 1004, "10.50.0.31", 8080
+                )
+                self.assertEqual(response["action"], "redirect")
+            finally:
+                client.release_container("web-restart")
+                client.close()
+                service.stop()
+                poke_unix_socket(socket_path)
+                service_thread.join(timeout=2)
+
     def test_allows_internet_egress_for_configured_network(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             socket_path = os.path.join(directory, "net.unix")
@@ -558,6 +610,29 @@ def reserve_local_port() -> int:
         return sock.getsockname()[1]
     finally:
         sock.close()
+
+
+def bind_published_port(
+    client: NetworkServiceClient,
+    container_id: str,
+    pid: int,
+    virtual_ip: str,
+    virtual_port: int,
+) -> dict[str, object]:
+    return client.request(
+        {
+            "version": 1,
+            "type": "bind_request",
+            "request_id": f"req-bind-{pid}",
+            "container_id": container_id,
+            "pid": pid,
+            "fd": 5,
+            "protocol": "tcp",
+            "interface": "eth0",
+            "network": "testnet",
+            "virtual_address": {"ip": virtual_ip, "port": virtual_port},
+        }
+    )
 
 
 def poke_unix_socket(path: str) -> None:

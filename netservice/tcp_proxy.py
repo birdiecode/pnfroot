@@ -114,7 +114,9 @@ class TcpForwarder:
         self.target_port = target_port
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.settimeout(0.2)
         self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
 
     def start(self) -> tuple[str, int]:
         self.listener.bind((self.listen_host, self.listen_port))
@@ -125,17 +127,23 @@ class TcpForwarder:
             name=f"tcp-forwarder-{self.forwarder_id}",
         )
         thread.daemon = True
+        self._thread = thread
         thread.start()
         return address
 
     def stop(self) -> None:
         self._stop.set()
         self.close_listener()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
                 client, _ = self.listener.accept()
+            except TimeoutError:
+                continue
             except OSError:
                 break
             thread = threading.Thread(target=self._handle_client, args=(client,))
