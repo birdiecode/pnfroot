@@ -448,7 +448,9 @@ def extract_tar_safe(layer_path: Path, rootfs_path: Path) -> None:
             if member.islnk():
                 link_target = _resolve_rootfs_path(rootfs, member.linkname)
                 target.unlink(missing_ok=True)
-                os.link(link_target, target)
+                # Android's Python omits os.link; a byte-for-byte copy keeps
+                # the layer portable while preserving the hardlink contents.
+                shutil.copyfile(link_target, target)
                 continue
             source = archive.extractfile(member)
             if source is None:
