@@ -54,6 +54,7 @@ from image_store import (
 )
 from image_service import ImageService
 import ptrace_syscalls
+from virtual_paths import BindMount
 from virtual_network import (
     ContainerNetworkConfig,
     NetworkServiceClient,
@@ -1030,6 +1031,35 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             return str(ROOT)
         return self.container_cwd(container)
 
+    def container_binds(self, container: dict[str, Any]) -> list[BindMount]:
+        """Translate CRI mounts into the virtual rootfs view.
+
+        CRI/kubelet creates ConfigMap, Secret and projected volumes as host
+        directories and passes them in ContainerConfig.mounts.  The ptrace
+        execution path does not have a real mount namespace, so these mounts
+        must be represented as virtual bind mounts explicitly.
+        """
+        binds: list[BindMount] = []
+        for mount in container.get("mounts", []):
+            if not isinstance(mount, dict):
+                continue
+            host_path = mount.get("host_path")
+            container_path = mount.get("container_path")
+            if not isinstance(host_path, str) or not isinstance(container_path, str):
+                continue
+            if not host_path or not container_path:
+                continue
+            binds.append(
+                BindMount.from_paths(
+                    host_path,
+                    container_path,
+                    source_display=host_path,
+                    recursive=True,
+                    origin="cri",
+                )
+            )
+        return binds
+
     def close_fds(self, *fds: int | None) -> None:
         for fd in set(fds) - {None}:
             try:
@@ -1173,6 +1203,7 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
                     exit_code = ptrace_syscalls.run_tracee(
                         command,
                         rootfs_path=str(rootfs) if rootfs is not None else None,
+                        binds=self.container_binds(container),
                         cwd=self.container_virtual_cwd(container),
                         env=self.container_env(container),
                         stdin_fd=child_stdin,
@@ -1486,6 +1517,15 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
             "command": list(config.command) if config.command else [],
             "args": list(config.args) if config.args else [],
             "working_dir": config.working_dir or None,
+            "mounts": [
+                {
+                    "host_path": mount.host_path,
+                    "container_path": mount.container_path,
+                    "readonly": mount.readonly,
+                    "propagation": mount.propagation,
+                }
+                for mount in config.mounts
+            ],
             "log_path": log_path,
             "envs": normalize_envs(config.envs),
             "uid": identity["uid"],
