@@ -216,6 +216,12 @@ def syscall_entry(pid: int) -> SyscallRecord:
         int(regs.r9),
     ]
     metadata: dict[str, object] = {}
+    # Some Android kernels deliver faccessat2 as an unhandled SIGSYS before
+    # normal path virtualization can run. Downgrade it at syscall entry.
+    if name == "faccessat2" and SYSCALL_NUMBERS.get("faccessat") is not None:
+        regs.orig_rax = SYSCALL_NUMBERS["faccessat"]
+        set_regs(pid, regs)
+        number = SYSCALL_NUMBERS["faccessat"]
     if name == "rseq" or (
         name == "set_robust_list" and platform.system() == "Android"
     ):
