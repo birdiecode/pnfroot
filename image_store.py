@@ -413,7 +413,10 @@ def extract_tar_safe(layer_path: Path, rootfs_path: Path) -> None:
             pure_name = PurePosixPath(name)
             if pure_name.is_absolute() or ".." in pure_name.parts:
                 raise ValueError(f"unsafe image layer path: {member.name}")
-            target = rootfs / name if member.issym() else (rootfs / name).resolve()
+            # Keep the archive path lexical for all entry types. Resolving a
+            # parent symlink (notably usr/bin/cmp in Debian layers) makes a
+            # valid in-root entry appear to escape the rootfs.
+            target = rootfs / name
             if target != rootfs and rootfs not in target.parents:
                 raise ValueError(f"unsafe image layer path: {member.name}")
 
