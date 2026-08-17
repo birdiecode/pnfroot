@@ -731,6 +731,37 @@ class RuntimeService(api_pb2_grpc.RuntimeServiceServicer):
                 shutil.rmtree(image_path, ignore_errors=True)
             else:
                 return image_path
+        # Resolve immutable digest refs against metadata from a prior pull.
+        for cached in self.image_store_dir.iterdir():
+            if not cached.is_dir() or not image_dir_has_layers(cached):
+                continue
+            metadata = read_image_metadata(cached) or {}
+            if image_ref in {
+                metadata.get("image_id"),
+                metadata.get("manifest_digest"),
+            }:
+                return cached
+        # kubelet commonly supplies the immutable manifest digest as image_ref
+        # while the CRI pull stored the image under its tag. Reuse that cache
+        # instead of contacting the registry again on every container start.
+        if image_name:
+            tagged_path = self.image_path(image_name)
+            if self.image_available(image_name):
+                return tagged_path
+            # Docker's CRI image status may return a fully-qualified name
+            # (docker.io/library/foo:tag), while the pull was keyed as
+            # foo:tag. Try the short repository name as a cache alias.
+            short_name = image_name.rsplit("/", 1)[-1]
+            if short_name != image_name:
+                tagged_path = self.image_path(short_name)
+                if self.image_available(short_name):
+                    return tagged_path
+            # Also tolerate registry-qualified names (docker.io/library/foo)
+            # whose historical cache directory has a different prefix.
+            short_dir = image_dir_name(short_name)
+            for cached in self.image_store_dir.glob(f"*{short_dir}"):
+                if cached.is_dir() and image_dir_has_layers(cached):
+                    return cached
         if self.image_available(image_ref):
             return image_path
         if image_path.exists() and not self.image_available(image_ref):
