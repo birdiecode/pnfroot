@@ -11,6 +11,7 @@ import tarfile
 import time
 import uuid
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -406,7 +407,13 @@ def extract_tar_safe(layer_path: Path, rootfs_path: Path) -> None:
             name = member.name.lstrip("./")
             if not name:
                 continue
-            target = (rootfs / name).resolve()
+            # Validate archive names lexically. Resolving through an existing
+            # symlink (e.g. Debian's /etc/alternatives) incorrectly flags
+            # legitimate layers as path traversal.
+            pure_name = PurePosixPath(name)
+            if pure_name.is_absolute() or ".." in pure_name.parts:
+                raise ValueError(f"unsafe image layer path: {member.name}")
+            target = rootfs / name if member.issym() else (rootfs / name).resolve()
             if target != rootfs and rootfs not in target.parents:
                 raise ValueError(f"unsafe image layer path: {member.name}")
 
