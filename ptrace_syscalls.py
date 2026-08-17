@@ -224,6 +224,12 @@ def syscall_entry(pid: int) -> SyscallRecord:
         metadata["forced_result"] = -errno.ENOSYS
     if ROOTFS is not None:
         metadata.update(ROOTFS.rewrite_syscall_entry(pid, name, args, regs))
+        # Android kernels may reject arm64 faccessat2 with SIGSYS. The older
+        # faccessat ABI has the same path check semantics needed by glibc;
+        # downgrade after virtualizing the pathname.
+        if name == "faccessat2" and SYSCALL_NUMBERS.get("faccessat") is not None:
+            regs.orig_rax = SYSCALL_NUMBERS["faccessat"]
+            set_regs(pid, regs)
     if VIRTUAL_IDS is not None:
         metadata.update(VIRTUAL_IDS.neutralize_syscall(pid, name, regs))
     if VIRTUAL_NETWORK is not None:
